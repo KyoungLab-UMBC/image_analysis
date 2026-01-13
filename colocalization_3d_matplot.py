@@ -6,7 +6,6 @@ from pptx import Presentation
 from pptx.util import Inches
 import io
 import warnings
-import sys
 import os
 from scipy import signal
 from numba import jit
@@ -126,91 +125,88 @@ def create_plot_image(red_data, green_data, x_axis, obj_id):
 
 def create_dimetric_thumbnail(crop_r, crop_g):
     """
-    Creates a 3D Volumetric Thumbnail (Dimetric View).
+    Creates a 3D Volumetric Thumbnail.
     - Black Background
-    - Cropped to central region [4:16]
-    - Alpha fades linearly from Center (1.0) to Edge (0.0)
+    - Alpha Scales with Intensity (Max 0.5) to prevent occlusion
+    - Additive Blending (Red + Green = Yellow)
+    - Custom Contrast (Median to Peak)
     """
-    # 1. Setup Black Figure
     fig = plt.figure(figsize=(4, 4), facecolor='black')
     ax = fig.add_subplot(111, projection='3d')
     ax.set_facecolor('black')
     
-    # Remove grids and panes for a pure "space" look
     ax.grid(False)
     ax.set_axis_off()
-    # Ensure panes are transparent/black
     ax.xaxis.pane.fill = False
     ax.yaxis.pane.fill = False
     ax.zaxis.pane.fill = False
 
-    # 2. Crop to [4:17] (Indices 4 to 16 inclusive)
-    # Original is usually 21x21x21. This extracts the center 13x13x13.
     s_start, s_end = 4, 17
     sub_r = crop_r[s_start:s_end, s_start:s_end, s_start:s_end]
     sub_g = crop_g[s_start:s_end, s_start:s_end, s_start:s_end]
     
-    # 3. Pre-calculate Radial Alpha Gradient
-    # Shape is (13, 13, 13). Center is (6, 6, 6).
-    d, h, w = sub_r.shape
-    cz, cy, cx = d // 2, h // 2, w // 2
-    
-    # Create coordinate grid
-    Z, Y, X = np.ogrid[:d, :h, :w]
-    dist_from_center = np.sqrt((Z - cz)**2 + (Y - cy)**2 + (X - cx)**2)
-    max_dist = np.sqrt(cz**2 + cy**2 + cx**2) # Distance to corner
-    
-    # Linear Falloff: 1 at center -> 0 at corner
-    # Clip to ensure no negative values
-    radial_alpha = np.clip(1 - (dist_from_center / max_dist), 0, 1)
+    cz, cy, cx = 6, 6, 6 
 
-    # Helper to plot a channel
-    def plot_channel(arr, color_rgb):
-        # Normalize Intensity (0 to 1)
-        if arr.max() <= 0: return
-        arr_norm = arr / arr.max()
+    # --- NORMALIZE FUNCTION ---
+    def get_normalized_channel(arr, is_red):
+        v_min = np.median(arr)
         
-        # Combine Intensity with Radial Gradient
-        # Final Alpha = Pixel Intensity * Radial Falloff
-        final_alpha = arr_norm * radial_alpha
-        
-        # Threshold: Only plot points visible enough to matter
-        # Lower threshold allows faint details, but 0.1 cleans up "dust"
-        mask = final_alpha > 0.02  # Was 0.05
-        
-        if not np.any(mask): return
-        
+        if is_red:
+            center_val = arr[cz, cy, cx]
+            v_max = center_val if center_val > v_min else np.max(arr)
+            # Boost Red Exposure slightly to make mid-tones visible
+            boost = 3.0 
+        else:
+            v_max = np.max(arr)
+            boost = 1.0
+
+        if v_max <= v_min: v_max = v_min + 1.0
+            
+        # Normalize
+        arr_norm = (arr - v_min) / (v_max - v_min)
+        arr_norm = arr_norm * boost
+        return np.clip(arr_norm, 0, 1)
+
+    norm_r = get_normalized_channel(sub_r, is_red=True)
+    norm_g = get_normalized_channel(sub_g, is_red=False)
+
+    # --- COMBINE & PLOT ---
+    # 1. Calculate Combined Intensity (Max of R or G at each point)
+    # This determines how "important" the pixel is.
+    max_intensity = np.maximum(norm_r, norm_g)
+
+    # 2. Threshold
+    # We remove pixels that are too dark to matter (cleaner view)
+    mask = max_intensity > 0.1 
+    
+    if np.any(mask):
         z, y, x = np.where(mask)
-        alphas = final_alpha[mask]
         
-        colors = np.zeros((len(alphas), 4))
-        colors[:, 0:3] = color_rgb
+        colors = np.zeros((len(z), 4))
+        colors[:, 0] = norm_r[mask] # Red
+        colors[:, 1] = norm_g[mask] # Green
+        colors[:, 2] = 0.0          # Blue
         
-        # 2. INCREASE OPACITY: Make them look more solid
-        # Clip max alpha to 1.0 (fully solid) instead of 0.8
-        colors[:, 3] = np.clip(alphas * 1.5, 0.2, 1.0) 
+        # --- DYNAMIC ALPHA CORRECTION ---
+        # Instead of fixed 0.5, we scale alpha by intensity.
+        # Brightest pixel (1.0) -> 0.5 Alpha
+        # Dim pixel (0.2)       -> 0.1 Alpha (Transparent)
+        # This allows you to "see through" the dark parts.
+        intensities = max_intensity[mask]
+        colors[:, 3] = np.clip(intensities * 0.5, 0.05, 0.5)
         
-        # 3. CHANGE MARKER & SIZE:
-        # s=35 makes them large enough to overlap
-        # marker='s' (square) fills the gaps better than circles
-        ax.scatter(x, y, z, c=colors, s=35, depthshade=False, marker='s', linewidth=0)
+        # Plot
+        ax.scatter(x, y, z, c=colors, s=35, depthshade=False, 
+                   marker='s', linewidth=0, edgecolors='none', antialiased=False)
 
-    # Plot Red
-    plot_channel(sub_r, [1, 0, 0])
-    
-    # Plot Green
-    plot_channel(sub_g, [0, 1, 0])
-
-    # Standard Dimetric View
     ax.view_init(elev=25, azim=45)
     
-    # Save with transparent background (so the black fig shows, or use black face)
     img_stream = io.BytesIO()
-    # facecolor='black' ensures the saved image has the black background
     plt.savefig(img_stream, format='png', dpi=100, facecolor='black')
     plt.close(fig)
     img_stream.seek(0)
     return img_stream
+
 
 def process_single_object(data_package):
     """
