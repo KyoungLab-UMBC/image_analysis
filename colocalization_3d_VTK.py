@@ -300,7 +300,7 @@ def process_single_object(data_package):
     
     # --- Outlier Detection ---
     is_outlier = False
-    if np.max(norm_r) > 30 or np.max(norm_g) > 30 or norm_r[0] < np.max(norm_r):
+    if np.max(norm_r) > 30 or np.max(norm_g) > 30 or not (np.argmax(norm_r) in [0, 1]):
         is_outlier = True
 
     # 3. Classification
@@ -309,9 +309,8 @@ def process_single_object(data_package):
     
     # 4. Generate Images
     x_vals = np.arange(0, 11)
-    plot_title = f"Object: {obj_id} (OUTLIER)" if is_outlier else f"Object: {obj_id}"
     
-    plot_bytes = create_plot_image(norm_r, norm_g, x_vals, plot_title).getvalue()
+    plot_bytes = create_plot_image(norm_r, norm_g, x_vals, obj_id).getvalue()
     
     # NEW: Generate Two Views with RGBA mixing and BOX Alpha Gradient
     thumb1_bytes, thumb2_bytes = create_dimetric_thumbnails_rgba(crop_r, crop_g)
@@ -402,11 +401,9 @@ def main(red_path, green_path, mask_path, output_pptx):
         for i, result in enumerate(results_generator):
             if result is None: continue
             
-            if (i + 1) % 10 == 0:
+            if (i + 1) % 50 == 0:
                 print(f" Completed {i + 1}/{len(tasks)}...")
 
-            if result['is_outlier']:
-                print(f"  > Object {result['id']}: OUTLIER (Max > 30). Excluded from stats.")
             else:
                 key = (result['trend_class'], result['size_class'])
                 if key not in groups: groups[key] = {'r': [], 'g': []}
@@ -439,8 +436,8 @@ def main(red_path, green_path, mask_path, output_pptx):
 
             lines = [
                 f"Object ID: {result['id']}",
-                f"Coords(z,y,x): ({result['cz']}, {result['cy']}, {result['cx']})",
-                f"Volume(px): {result['area']}",
+                f"Coords(x,y,z): ({result['cx']}, {result['cy']}, {result['cz']})",
+                f"Volume(voxels): {result['area']}",
                 f"Trend: {result['trend_class']}",
                 f"Size: {result['size_class']}",
                 status_line
@@ -505,7 +502,7 @@ if __name__ == "__main__":
             os.path.join(base_path, "Cell2_ex560em593_250mW_200ms_NoGlucose60min_d62_corrected.tif"), 
             os.path.join(base_path, "Cell2_ex488em514_230mW_200ms_NoGlucose60min_d16.tif"), 
             os.path.join(base_path, "Cell2_ex560em593_250mW_200ms_NoGlucose60min_d62_corrected-1.segmentation.tif"),     
-            os.path.join(base_path, "Cell2_NoGlucose60min_3D_Report_VTK_BoxFade.pptx")
+            os.path.join(base_path, "Cell2_NoGlucose60min_3D_Report.pptx")
         )
     else:
         print("Please configure the 'base_path' in the script.")
