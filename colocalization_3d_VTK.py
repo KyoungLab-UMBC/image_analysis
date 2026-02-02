@@ -13,6 +13,7 @@ from scipy import signal
 from numba import jit
 import concurrent.futures
 from pptx.dml.color import RGBColor
+import trend_analysis as trend_tools
 
 # Set matplotlib backend to Agg for thread safety (no GUI)
 plt.switch_backend('Agg')
@@ -67,32 +68,6 @@ def calculate_spherical_profile(crop_r, crop_g, crop_mask, obj_id):
             
     return means_r, means_g
 
-# --- HELPER FUNCTIONS ---
-
-def analyze_profile_trend(norm_r, norm_g):
-    """
-    Classifies relationship. Adjusted for shorter profile (len 11).
-    """
-    # Pearson Correlation
-    if len(norm_r) > 2:
-        r_value = np.corrcoef(norm_r, norm_g)[0, 1]
-    else:
-        r_value = 0 
-        
-    if np.isnan(r_value): r_value = 0
-
-    prominence = np.ptp(norm_g) / 5 if np.ptp(norm_g) > 0 else 0
-    peaks, _ = signal.find_peaks(norm_g, prominence=prominence)
-
-    # Classification logic (adjusted indices for smaller range)
-    if r_value >= 0.75 or (norm_g[0] > norm_g[1] and norm_g[1] > norm_g[2]):
-        return "Colocalized"
-    elif r_value <= -0.75 or norm_g[0] == min(norm_g) and np.median(norm_g) - norm_g[0] >= 3 * prominence:
-        return "Anticolocalized"
-    elif np.any((peaks >= 1) & (peaks <= 6)) or max(norm_g) - max(norm_g[1:3]) <= prominence:
-        return "Around"
-    else:
-        return "No trend"
 
 def create_plot_image(red_data, green_data, x_axis, obj_id):
     fig, ax1 = plt.subplots(figsize=(6, 4))
@@ -305,7 +280,7 @@ def process_single_object(data_package):
 
     # 3. Classification
     size_class = "small" if area <= 90 else "large" 
-    trend_class = analyze_profile_trend(norm_r, norm_g)
+    trend_class = trend_tools.analyze_profile_trend(norm_r, norm_g)
     
     # 4. Generate Images
     x_vals = np.arange(0, 11)
