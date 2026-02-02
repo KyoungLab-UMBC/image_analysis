@@ -1,0 +1,29 @@
+{
+    "python.terminal.activateEnvironment": true,
+    "python.condaPath": "D:\\Anaconda\\Scripts\\conda.exe",
+    
+    // CHANGED: Pointing to your specific 'img_analysis' environment
+    "python.defaultInterpreterPath": "D:\\Anaconda\\envs\\img_analysis\\python.exe",
+    
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    
+    "files.associations": {
+        "image_correction": "python"
+    },
+
+    // NEW: This automatically sets JAVA_HOME when you open the terminal in VS Code.
+    // You can now remove 'os.environ["JAVA_HOME"] = ...' from your Python code.
+    "terminal.integrated.env.windows": {
+        "JAVA_HOME": "D:\\Anaconda\\envs\\img_analysis\\Library"
+    },
+
+    "git.autofetch": true,
+    "terminal.integrated.inheritEnv": false,
+    
+    // --- NEW FIX FOR VTK ---
+    "python.analysis.extraPaths": [
+        "D:\\Anaconda\\envs\\img_analysis\\Lib\\site-packages",
+        "D:\\Anaconda\\envs\\img_analysis\\Lib\\site-packages\\vtkmodules"
+    ]
+}
