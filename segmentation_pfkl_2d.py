@@ -1,16 +1,9 @@
-
 import os
 import glob
-print("--- LAUNCHING SCRIPT ---")  # <--- ADD THIS AT LINE 1
 import numpy as np
 import tifffile
-print("--- IMPORTING NUMPY ---")   # <--- ADD THIS
 from scipy.ndimage import gaussian_laplace
-print("--- IMPORTING SCIPY ---")   # <--- ADD THIS
 from skimage import measure, morphology
-from skimage.restoration import denoise_tv_chambolle 
-print("--- IMPORTING SKIMAGE ---") # <--- ADD THIS
-# ... rest of your code ...
 
 def dot_2d(struct_img, log_sigma, cutoff=-1):
     """Apply 2D spot filter (LoG)"""
@@ -23,13 +16,6 @@ def dot_2d(struct_img, log_sigma, cutoff=-1):
         return response
     else:
         return response > cutoff
-
-def edge_preserving_smoothing_2d(struct_img, weight=0.1):
-    """
-    Replaced ITK with Scikit-Image Total Variation Denoising.
-    This is stable and won't crash the kernel.
-    """
-    return denoise_tv_chambolle(struct_img, weight=weight)
 
 def normalize_fast(img, check_rate=100):
     stride = int(np.sqrt(check_rate))
@@ -80,20 +66,14 @@ def process_folder(input_folder, output_folder):
             print(f"  > Image loaded. Shape: {raw_img.shape}")
 
             norm_img = normalize_fast(raw_img, check_rate=100)
-            
-            # Use the new safe smoothing
-            smoothed = edge_preserving_smoothing_2d(norm_img, weight=0.1)
-            print("  > Smoothing done.")
-            
+
             # --- Dot Detection ---
-            mask_a = dot_2d(smoothed, log_sigma=4.5, cutoff=0.2)
-            mask_b = dot_2d(smoothed, log_sigma=3.0, cutoff=0.15)
-            mask_c = dot_2d(smoothed, log_sigma=4.5, cutoff=0.2)
+            mask_a = dot_2d(norm_img, log_sigma=4.5, cutoff=0.2)
+            mask_b = dot_2d(norm_img, log_sigma=3.0, cutoff=0.12)
+            raw_mask_c = dot_2d(norm_img, log_sigma=1.5, cutoff=0.06)
+            mask_c = filter_shape(raw_mask_c, max_area=50, max_ar=2.5)
             
-            raw_mask_d = dot_2d(smoothed, log_sigma=1.5, cutoff=0.06)
-            mask_d = filter_shape(raw_mask_d, max_area=50, max_ar=2.5)
-            
-            combined_mask = mask_a | mask_b | mask_c | mask_d
+            combined_mask = mask_a | mask_b | mask_c
             final_mask = morphology.remove_small_objects(combined_mask, min_size=5)
             
             save_img = (final_mask * 255).astype(np.uint8)
