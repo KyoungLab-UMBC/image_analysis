@@ -31,27 +31,74 @@ def normalize_minmax(img):
         return np.zeros_like(img)
     return (img - min_v) / (max_v - min_v)
 
-def filter_shape(mask, max_area, max_ar):
+def filter_shape(mask, max_ar=2.5, min_area=5, min_solidity=0.8):
+    """
+    Filters objects by:
+    1. Min Area (removes tiny noise < 5 pixels)
+    2. Max Area (removes large blobs)(deleted, but could be added back if needed)
+    3. Aspect Ratio (removes lines)
+    4. Solidity (removes jagged/worm shapes)
+    """
     labeled_img = measure.label(mask)
     regions = measure.regionprops(labeled_img)
     new_mask = np.zeros_like(mask, dtype=bool)
     
     for region in regions:
-        if region.area > max_area: continue
+        # 1. Min Area Filter (NEW)
+        if region.area < min_area: continue
         
+        # 3. Aspect Ratio Filter
         if region.minor_axis_length == 0:
             ar = 9999.0
         else:
             ar = region.major_axis_length / region.minor_axis_length
             
         if ar > max_ar: continue
+
+        # 4. Solidity Filter (Keeps compact dots, removes jagged lines)
+        if region.solidity < min_solidity: continue
             
         coords = region.coords
         new_mask[coords[:,0], coords[:,1]] = True
         
     return new_mask
 
-def separate_attached_objects_watershed(binary_mask):
+def remove_diagonal_bridges(binary_mask):
+    """
+    Detects diagonal connections (8-connectivity) and breaks them.
+    Uses array slicing (views) for robust, explicit neighbor checking.
+    """
+    # Create views for the 2x2 sliding window components
+    # TL = Top-Left, TR = Top-Right, BL = Bottom-Left, BR = Bottom-Right
+    # These views are references, so modifying them modifies the original mask.
+    TL = binary_mask[:-1, :-1]
+    TR = binary_mask[:-1, 1:]
+    BL = binary_mask[1:, :-1]
+    BR = binary_mask[1:, 1:]
+    
+    # --- Pattern A: Top-Left to Bottom-Right connection ---
+    # Pattern: 1 0
+    #          0 1
+    # We detect where TL==1, TR==0, BL==0, BR==1
+    mask_a = (TL == True) & (TR == False) & (BL == False) & (BR == True)
+    
+    # Break the bridge by deleting the Bottom-Right pixel (BR)
+    # You could delete TL instead, but we just need to break one.
+    BR[mask_a] = False
+    
+    # --- Pattern B: Top-Right to Bottom-Left connection (YOUR ISSUE) ---
+    # Pattern: 0 1
+    #          1 0
+    # We detect where TL==0, TR==1, BL==1, BR==0
+    mask_b = (TL == False) & (TR == True) & (BL == True) & (BR == False)
+    
+    # Break the bridge by deleting the Bottom-Left pixel (BL)
+    # This specifically targets the '1' at the bottom-left of the junction.
+    BL[mask_b] = False
+    
+    return binary_mask
+
+def separate_attached_objects_watershed(binary_mask, min_distance):
     """
     Separates attached objects in a binary mask using Watershed.
     Returns a binary mask with lines separating the objects.
@@ -64,14 +111,14 @@ def separate_attached_objects_watershed(binary_mask):
     
     # 2. Find Peaks (Markers)
     # min_distance controls how close two peaks can be to be considered separate
-    coords = feature.peak_local_max(distance, footprint=np.ones((3, 3)), labels=binary_mask)
+    coords = feature.peak_local_max(distance, min_distance= min_distance, labels=binary_mask)
     mask_peaks = np.zeros(distance.shape, dtype=bool)
     mask_peaks[tuple(coords.T)] = True
     
     markers, _ = ndi.label(mask_peaks)
     
     # 3. Watershed
-    labels = segmentation.watershed(-distance, markers, mask=binary_mask)
+    labels = segmentation.watershed(-distance, markers, mask=binary_mask, watershed_line=True)
     
     # 4. Convert back to binary (labels > 0)
     # Note: Watershed lines (0) will separate the objects
@@ -105,7 +152,41 @@ def roi_to_mask(roi, image_shape):
         
     return mask
 
-def process_roi_image(roi_img, roi_mask):
+def smart_merge_objects(mask_large, mask_small):
+    """
+    Merges a large mask (shape) with a small mask (details/seeds).
+    Preserves the separation found in mask_small while filling the volume of mask_large.
+    """
+    # 1. Use the small mask as the markers (seeds)
+    # CRITICAL FIX: connectivity=1 prevents diagonally touching seeds 
+    # from being merged into a single label.
+    markers = measure.label(mask_small, connectivity=1)
+    
+    # 2. Handle "Orphans": Objects found in Large but MISSED in Small
+    mask_large_labeled = measure.label(mask_large, connectivity=1)
+    
+    regions = measure.regionprops(mask_large_labeled)
+    max_label = np.max(markers)
+    
+    for region in regions:
+        coords = region.coords
+        # Check if this large object contains any seed
+        if np.max(markers[coords[:, 0], coords[:, 1]]) == 0:
+            max_label += 1
+            markers[coords[:, 0], coords[:, 1]] = max_label
+
+    # 3. Define the "basin"
+    union_mask = mask_large | mask_small
+    if np.sum(union_mask) == 0:
+        return union_mask
+
+    # 4. Run Watershed
+    distance = ndi.distance_transform_edt(union_mask)
+    labels = segmentation.watershed(-distance, markers, mask=union_mask, watershed_line=True)
+    
+    return labels > 0
+
+def process_roi_image(roi_img, roi_mask, save_prefix=None):
     """
     Applies the specific 2-branch logic to a single cropped ROI image.
     """
@@ -120,12 +201,12 @@ def process_roi_image(roi_img, roi_mask):
     norm_1 = normalize_minmax(sub_1)
     
     # 3. Dot Detect
-    mask_1 = dot_2d(norm_1, log_sigma=4.0, cutoff=0.1)
+    mask_1 = dot_2d(norm_1, log_sigma=4.0, cutoff=0.07)
     mask_2 = dot_2d(norm_1, log_sigma=2.0, cutoff=0.05)
     
     # 4. Merge & Watershed
     merged_1 = mask_1 | mask_2
-    mask_a = separate_attached_objects_watershed(merged_1)
+    mask_a = separate_attached_objects_watershed(merged_1, min_distance=6)
 
     # === BRANCH 2: Radius 3 (Small/Fine features) ===
     # 1. Background Subtract (Radius 3)
@@ -137,21 +218,34 @@ def process_roi_image(roi_img, roi_mask):
     norm_2 = normalize_minmax(sub_2)
     
     # 3. Dot Detect
-    mask_3 = dot_2d(norm_2, log_sigma=2.0, cutoff=0.1)
-    
-    raw_mask_4 = dot_2d(norm_2, log_sigma=1.0, cutoff=0.05)
-    mask_4 = filter_shape(raw_mask_4, max_area=50, max_ar=2.5)
+    mask_3 = dot_2d(norm_2, log_sigma=2.0, cutoff=0.08)  
+    mask_4 = dot_2d(norm_2, log_sigma=1.0, cutoff=0.04)
     
     # 4. Merge & Watershed
-    merged_2 = mask_3 | mask_4
-    mask_b = separate_attached_objects_watershed(merged_2)
+    raw_merged_2 = mask_3 | mask_4
+    merged_2 = filter_shape(raw_merged_2)
+    mask_b = separate_attached_objects_watershed(merged_2, min_distance=4)
+
+    # === NEW: DEBUG SAVING ===
+    if save_prefix:
+        tifffile.imwrite(f"{save_prefix}_debug_mask_a.tif", (mask_a * 255).astype(np.uint8))
+        tifffile.imwrite(f"{save_prefix}_debug_mask_b.tif", (mask_b * 255).astype(np.uint8))
 
     # === FINAL MERGE ===
-    final_combined = mask_a | mask_b
-    # This prevents small fragments cut by the ROI border from being deleted if they were part of a larger object
+    # OLD CODE: final_combined = mask_a | mask_b
+    
+    # CHANGED: Use smart merge to keep mask_b separations inside mask_a shapes
+    # === FINAL MERGE ===
+    final_combined = smart_merge_objects(mask_a, mask_b)
+    
+    # Mask OUTSIDE pixels
     final_combined = final_combined & roi_mask
-    # Discard objects < 5 pixels
-    final_cleaned = morphology.remove_small_objects(final_combined, min_size=5)
+    
+    # CHANGED: Physically break diagonal touches before saving
+    final_combined = remove_diagonal_bridges(final_combined)
+    
+    # Clean up small objects (connectivity=1 is now natural)
+    final_cleaned = morphology.remove_small_objects(final_combined, min_size=5, connectivity=1)
     
     return final_cleaned
 
@@ -209,9 +303,16 @@ def process_folder(input_folder, output_folder):
                 
                 # --- RUN SEGMENTATION ON THE CROP ---
                 # We only process if there is actual data
+                # --- RUN SEGMENTATION ON THE CROP ---
+                # We only process if there is actual data
                 if np.max(roi_crop) > 0:
-                    # CHANGED: Pass the mask into the function
-                    seg_mask_crop = process_roi_image(roi_crop, roi_mask_crop)
+                    
+                    # CHANGED: Create a prefix for this specific ROI
+                    debug_prefix = os.path.join(output_folder, f"{base_name}_{roi_name}")
+                    
+                    # CHANGED: Pass the prefix to the function
+                    seg_mask_crop = process_roi_image(roi_crop, roi_mask_crop, save_prefix=debug_prefix)
+                    
                 else:
                     seg_mask_crop = np.zeros_like(roi_crop, dtype=bool)
 
@@ -234,7 +335,7 @@ def process_folder(input_folder, output_folder):
 
 if __name__ == "__main__":
     # --- CONFIGURATION ---
-    input_dir = r"/media/kyoung/Elements1/20250517 PFKL-mCherry_Queen37C_MitotrackerDeepred - High Salt Conc - 37 degree - WideField/Plate 2 - 180 mM/Cell6/1_AddSalt45min/Red input"
-    output_dir = r"/media/kyoung/Elements1/20250517 PFKL-mCherry_Queen37C_MitotrackerDeepred - High Salt Conc - 37 degree - WideField/Plate 2 - 180 mM/Cell6/1_AddSalt45min/Output"
+    input_dir = r"F:\20250517 PFKL-mCherry_Queen37C_MitotrackerDeepred - High Salt Conc - 37 degree - WideField\Plate 2 - 180 mM\Cell6\1_AddSalt45min\Red input"
+    output_dir = r"F:\20250517 PFKL-mCherry_Queen37C_MitotrackerDeepred - High Salt Conc - 37 degree - WideField\Plate 2 - 180 mM\Cell6\1_AddSalt45min\Output"
     bg_tools.init_imagej()
     process_folder(input_dir, output_dir)
