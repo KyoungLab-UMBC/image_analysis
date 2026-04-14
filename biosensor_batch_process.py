@@ -3,14 +3,16 @@ import numpy as np
 import tifffile
 from scipy.ndimage import gaussian_filter
 from concurrent.futures import ThreadPoolExecutor
-import background_correction
+import util.background_correction as background_correction
+import util.config as config
+import itertools
 
 # ================= CONFIGURATION =================
 # 1. Input: Select your path here
-ROOT_PATH = r"F:\20250517 PFKL-mCherry_Queen37C_MitotrackerDeepred - High Salt Conc - 37 degree - WideField\Plate 2 - 180 mM" 
+ROOT_PATH = r"F:\20231123 PFKL-mCherry_Hylight - High Salt Conc - 37 degree - WideField\Plate 1 - Hylight 180mM" 
 
 # 2. Toggle Queen37C Mode
-QUEEN37C = True  
+QUEEN37C = config.QUEEN37C
 # =================================================
 
 def task_generator(root_path, is_queen):
@@ -100,18 +102,37 @@ def process_triplet(args):
     except Exception as e:
         print(f"[Error] Failed in {out_dir}: {e}")
 
+def chunked_iterable(iterable, size):
+    """Yields items from an iterator in batches of 'size'."""
+    it = iter(iterable)
+    while True:
+        chunk = tuple(itertools.islice(it, size))
+        if not chunk:
+            break
+        yield chunk
+
+
 def main():
     background_correction.init_imagej()
 
     print(f"Scanning root: {ROOT_PATH} ...")
-
-    # Use a generator to fetch tasks on demand
-    tasks = task_generator(ROOT_PATH, QUEEN37C)
     
-    # Process with limited workers to save RAM
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        # executor.map consumes the generator automatically
-        executor.map(process_triplet, tasks)
+    # 1. Create the generator
+    tasks_gen = task_generator(ROOT_PATH, QUEEN37C)
+    
+    # 2. Process in batches of 4 to manage RAM
+    BATCH_SIZE = 16
+    
+    for batch in chunked_iterable(tasks_gen, BATCH_SIZE):
+        print(f"Processing batch of {len(batch)} tasks...")
+        
+        # Create a new executor for each batch to ensure threads close completely
+        with ThreadPoolExecutor(max_workers = min(32, os.cpu_count())) as executor:
+            # list() forces the main thread to wait until this batch is 100% done
+            list(executor.map(process_triplet, batch))
+        
+        # 3. Clear RAM before next batch
+        background_correction.force_garbage_collection()
 
     print("All tasks completed.")
 
