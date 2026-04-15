@@ -1,5 +1,3 @@
-import os
-import zipfile
 import numpy as np
 import tifffile
 from pathlib import Path
@@ -7,8 +5,11 @@ from itertools import combinations_with_replacement
 from scipy import ndimage as ndi
 from skimage import draw
 from skimage.morphology import remove_small_objects
-from read_roi import read_roi_zip  # pip install read-roi
-
+from read_roi import read_roi_zip
+import util.config as cfg
+import util.roi_to_mask as roi_tools
+import util.background_correction as bg_tools
+from util.normalization import normalize_minmax
 # ==========================================
 # PART 1: Core Algorithm Functions (Merged)
 # ==========================================
@@ -152,54 +153,9 @@ def get_roi_bounding_box(roi_data):
         
     raise ValueError("Could not determine bounding box for ROI")
 
-def roi_to_mask(roi, image_shape):
-    """
-    Convert ROI data to a binary mask using specific logic for different shapes.
-    Adapted from segmentation_pfkl_2d.py
-    """
-    mask = np.zeros(image_shape, dtype=bool)
-    # Get type safely, default to unknown
-    roi_type = roi.get('type', '').lower() 
-    
-    try:
-        if roi_type == 'rectangle':
-            # Rectangles use top/left/width/height
-            r_start = int(roi['top'])
-            r_end = int(roi['top'] + roi['height'])
-            c_start = int(roi['left'])
-            c_end = int(roi['left'] + roi['width'])
-            
-            # Clip to image bounds to avoid errors
-            r_start = max(0, r_start)
-            c_start = max(0, c_start)
-            r_end = min(image_shape[0], r_end)
-            c_end = min(image_shape[1], c_end)
-            
-            mask[r_start:r_end, c_start:c_end] = True
-            
-        elif roi_type in ['polygon', 'freehand', 'traced']:
-            # Polygons use lists of x and y coordinates
-            r = roi['y']
-            c = roi['x']
-            rr, cc = draw.polygon(r, c, shape=image_shape)
-            mask[rr, cc] = True
-            
-        elif roi_type == 'oval':
-            r_center = roi['top'] + roi['height'] / 2
-            c_center = roi['left'] + roi['width'] / 2
-            r_radius = roi['height'] / 2
-            c_radius = roi['width'] / 2
-            rr, cc = draw.ellipse(r_center, c_center, r_radius, c_radius, shape=image_shape)
-            mask[rr, cc] = True
-            
-    except Exception as e:
-        print(f"    Warning: ROI conversion failed for type '{roi_type}': {e}")
-        
-    return mask
 
 def process_single_image(image_path, sigma_cutoff_pairs):
     print(f"Processing: {image_path}")
-    image_path = Path(image_path)
     
     # 1. Load Image
     try:
@@ -212,38 +168,19 @@ def process_single_image(image_path, sigma_cutoff_pairs):
     ndim = img.ndim
     is_3d = ndim == 3
     print(f"Image shape: {img.shape}, Detected as {'3D' if is_3d else '2D'}")
-
-    # 2. Search for ROIs (Try specific name first, then generic rois.zip)
-    potential_paths = [
-        image_path.parent / f"{image_path.stem}_rois.zip",
-        image_path.parent / "rois.zip"
-    ]
     
-    rois = None
-    for p in potential_paths:
-        if p.exists():
-            try:
-                rois = read_roi_zip(p)
-                print(f"  Found ROIs at: {p.name}")
-                break
-            except Exception as e:
-                print(f"  Error reading {p.name}: {e}")
-
-    if not rois:
-        print(f"No ROI file found. Skipping.")
-        return
+    rois = roi_tools.load_roi_file(cfg.R_RAW)
 
     # 3. Iterate ROIs
-    for i, (roi_name, roi_data) in enumerate(rois.items()):
-        roi_idx = i + 1
-        print(f"  > Processing ROI {roi_idx}: {roi_name}")
+    for roi_name, roi_data in rois.items():
+        print(f"  > Processing ROI {roi_name}")
         
         # === CHANGED PART START ===
         # Instead of 'get_roi_bounding_box', we generate the mask first (Robust Method)
         
         # Calculate mask for the specific 2D plane
         shape_2d = img.shape[-2:] # Height, Width
-        roi_mask = roi_to_mask(roi_data, shape_2d)
+        roi_mask = roi_tools.roi_to_mask(roi_data, shape_2d)
         
         # Get Bounding Box from the binary mask
         coords = np.argwhere(roi_mask)
@@ -257,28 +194,21 @@ def process_single_image(image_path, sigma_cutoff_pairs):
         
         # Crop Image
         if is_3d:
-            img_crop = img[:, y1:y2, x1:x2]
+            img_crop_raw = img[:, y1:y2, x1:x2]
         else:
-            img_crop = img[y1:y2, x1:x2]
+            img_crop_raw = img[y1:y2, x1:x2]
             
         # Crop the ROI mask as well (to apply after segmentation)
         roi_mask_crop = roi_mask[y1:y2, x1:x2]
         # === CHANGED PART END ===
 
-        if img_crop.size == 0:
+        if img_crop_raw.size == 0:
             print("    ROI crop is empty. Skipping.")
             continue
-
-        # 4. Normalization (Sample 1/1000 pixels)
-        flat_sample = img_crop.ravel()[::1000] 
-        if flat_sample.size == 0:
-            flat_sample = img_crop.ravel()
-            
-        val_min = float(flat_sample.min())
-        val_max = float(flat_sample.max())
         
-        img_norm = (img_crop.astype(float) - val_min) / (val_max - val_min + 1e-10)
-        img_norm = np.clip(img_norm, 0, 1)
+        # 4. Normalization (Sample 1/100 pixels)
+        img_crop = bg_tools.estimate_background_rolling_ball(img_crop_raw, radius=10, create_background=False, use_paraboloid=False)
+        img_norm = normalize_minmax(img_crop)
 
         # 5. Segmentation
         print("    Running segmentation...")
@@ -305,7 +235,7 @@ def process_single_image(image_path, sigma_cutoff_pairs):
             full_mask[y1:y2, x1:x2] = seg_crop.astype(np.uint8) * 255
 
         # Save
-        output_name = f"{image_path.stem}_{roi_idx}_mask.tif"
+        output_name = f"{image_path.stem}_{roi_name}_mask.tif"
         output_path = image_path.parent / output_name
         tifffile.imwrite(output_path, full_mask)
         print(f"    Saved: {output_name}")
@@ -320,12 +250,9 @@ if __name__ == "__main__":
     # Format: [[scale, cutoff], [scale, cutoff], ...]
     # Adjust these based on your specific filament thickness and brightness
     FILAMENT_PARAMS = [
-        [1.0, 0.1],  
-        [1.5, 0.2]
+        [1.0, 0.20],  
+        [1.5, 0.20]
     ]
-    
-    # Path to your image
-    TARGET_IMAGE = r"F:\20250517 PFKL-mCherry_Queen37C_MitotrackerDeepred - High Salt Conc - 37 degree - WideField\Plate 2 - 180 mM\Cell6\1_AddSalt45min\Cell0208.tif" 
-
+    bg_tools.init_imagej()  # Ensure ImageJ is initialized before processing
     # --- RUN ---
-    process_single_image(TARGET_IMAGE, FILAMENT_PARAMS)
+    process_single_image(cfg.MITO_RAW, FILAMENT_PARAMS)
