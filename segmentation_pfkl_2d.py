@@ -1,13 +1,13 @@
-import os
-import glob
+from pathlib import Path
 import numpy as np
 import tifffile
 from scipy import ndimage as ndi
 from skimage import measure, morphology, draw, segmentation, feature
 from read_roi import read_roi_zip
-import background_correction as bg_tools
-
-
+import util.background_correction as bg_tools
+import util.config as cfg
+import util.roi_to_mask as roi_tools
+from util.normalization import normalize_minmax
 
 def dot_2d(struct_img, log_sigma, cutoff=-1):
     """Apply 2D spot filter (LoG)"""
@@ -22,16 +22,8 @@ def dot_2d(struct_img, log_sigma, cutoff=-1):
     else:
         return response > cutoff
 
-def normalize_minmax(img):
-    """Normalize array to 0-1 range"""
-    img = img.astype(np.float32)
-    min_v = np.min(img)
-    max_v = np.max(img)
-    if max_v - min_v == 0:
-        return np.zeros_like(img)
-    return (img - min_v) / (max_v - min_v)
 
-def filter_shape(mask, max_ar=2.5, min_area=5, min_solidity=0.8):
+def filter_shape(mask, max_ar=2.6, min_area=5, min_solidity=0.85):
     """
     Filters objects by:
     1. Min Area (removes tiny noise < 5 pixels)
@@ -124,67 +116,155 @@ def separate_attached_objects_watershed(binary_mask, min_distance):
     # Note: Watershed lines (0) will separate the objects
     return labels > 0
 
-def roi_to_mask(roi, image_shape):
-    mask = np.zeros(image_shape, dtype=bool)
-    roi_type = roi['type']
-    
-    try:
-        if roi_type == 'rectangle':
-            r_start = roi['top']
-            r_end = roi['top'] + roi['height']
-            c_start = roi['left']
-            c_end = roi['left'] + roi['width']
-            mask[r_start:r_end, c_start:c_end] = True
-        elif roi_type in ['polygon', 'freehand', 'traced']:
-            r = roi['y']
-            c = roi['x']
-            rr, cc = draw.polygon(r, c, shape=image_shape)
-            mask[rr, cc] = True
-        elif roi_type == 'oval':
-            r_center = roi['top'] + roi['height'] / 2
-            c_center = roi['left'] + roi['width'] / 2
-            r_radius = roi['height'] / 2
-            c_radius = roi['width'] / 2
-            rr, cc = draw.ellipse(r_center, c_center, r_radius, c_radius, shape=image_shape)
-            mask[rr, cc] = True
-    except Exception as e:
-        print(f"Warning: ROI conversion failed: {e}")
-        
-    return mask
 
 def smart_merge_objects(mask_large, mask_small):
     """
-    Merges a large mask (shape) with a small mask (details/seeds).
-    Preserves the separation found in mask_small while filling the volume of mask_large.
+    Merges mask_large and mask_small using watershed based on specific overlap rules.
     """
-    # 1. Use the small mask as the markers (seeds)
-    # CRITICAL FIX: connectivity=1 prevents diagonally touching seeds 
-    # from being merged into a single label.
-    markers = measure.label(mask_small, connectivity=1)
-    
-    # 2. Handle "Orphans": Objects found in Large but MISSED in Small
-    mask_large_labeled = measure.label(mask_large, connectivity=1)
-    
-    regions = measure.regionprops(mask_large_labeled)
-    max_label = np.max(markers)
-    
-    for region in regions:
-        coords = region.coords
-        # Check if this large object contains any seed
-        if np.max(markers[coords[:, 0], coords[:, 1]]) == 0:
-            max_label += 1
-            markers[coords[:, 0], coords[:, 1]] = max_label
-
-    # 3. Define the "basin"
+    # 1. Merge mask_large and mask_small as union_mask
     union_mask = mask_large | mask_small
     if np.sum(union_mask) == 0:
         return union_mask
-
-    # 4. Run Watershed
+        
+    # Label all components to identify individual objects globally
+    labeled_union = measure.label(union_mask, connectivity=2)
+    labeled_small = measure.label(mask_small, connectivity=2)
+    labeled_large = measure.label(mask_large, connectivity=2)
+    
+    # Initialize the marker array
+    markers = np.zeros_like(union_mask, dtype=np.int32)
+    current_label = 1
+    
+    # 2. For each object in the union_mask
+    for region in measure.regionprops(labeled_union):
+        r_slice = region.slice
+        union_obj = region.image
+        
+        local_mask_large = mask_large[r_slice]
+        local_mask_small = mask_small[r_slice]
+        
+        # Isolate small and large labels specifically within this union object's bounding box
+        local_small_labels = labeled_small[r_slice].copy()
+        local_small_labels[~union_obj] = 0
+        
+        local_large_labels = labeled_large[r_slice].copy()
+        local_large_labels[~union_obj] = 0
+        
+        area_union = region.area
+        markers_in_this_union = 0
+        
+        # View of the marker array for this bounding box
+        m_slice = markers[r_slice]
+        
+        # --- For each object in the mask_small inside this object in union_mask ---
+        small_ids = np.unique(local_small_labels)
+        small_ids = small_ids[small_ids > 0]
+        
+        for sid in small_ids:
+            small_obj = (local_small_labels == sid)
+            area_small = np.sum(small_obj)
+            area_overlap = np.sum(small_obj & local_mask_large)
+            
+            if area_small > 0:
+                ratio_overlap = area_overlap / area_small
+                ratio_union = area_small / area_union
+                
+                # If overlap with large < 0.2 OR area ratio to union > 0.2, count as marker
+                if ratio_union >= 0.1:
+                    m_slice[small_obj] = current_label
+                    current_label += 1
+                    markers_in_this_union += 1
+                    
+        # --- For each object in the mask_large inside this object in union_mask ---
+        large_ids = np.unique(local_large_labels)
+        large_ids = large_ids[large_ids > 0]
+        
+        for lid in large_ids:
+            large_obj = (local_large_labels == lid)
+            area_large = np.sum(large_obj)
+            
+            # The area of objects in mask_small overlapped with this object in mask_large
+            overlap_mask = large_obj & local_mask_small
+            area_overlap = np.sum(overlap_mask)
+            
+            if area_large > 0:
+                ratio_overlap = area_overlap / area_large
+                ratio_large_union = area_large / area_union
+                # If overlap ratio < 0.3, count as marker
+                if ratio_overlap <= 0.15 and ratio_large_union <= 0.6:
+                    # Only assign marker to pixels that haven't already been claimed by a mask_small marker
+                    free_pixels = large_obj & (m_slice == 0)
+                    if np.any(free_pixels):
+                        m_slice[free_pixels] = current_label
+                        current_label += 1
+                        markers_in_this_union += 1
+                # If this object is only one part of the union
+                elif ratio_large_union <= 0.25:
+                    # Only assign marker to pixels that haven't already been claimed by a mask_small marker
+                    free_pixels = large_obj & (m_slice == 0)
+                    if np.any(free_pixels):
+                        m_slice[free_pixels] = current_label
+                        current_label += 1
+                        markers_in_this_union += 1
+                # If the total area of mask_small objects inside this large object is < 0.3 of its area, delete the markers previously assigned from mask_small
+                elif ratio_overlap <= 0.15 and ratio_large_union > 0.91:
+                    # Find the specific marker IDs generated by mask_small that overlap with this large object
+                    overlapping_marker_ids = np.unique(m_slice[overlap_mask])                    
+                    # Delete those entire markers from the slice
+                    for m_id in overlapping_marker_ids:
+                        if m_id > 0:  # Ignore 0 (background)
+                            m_slice[m_slice == m_id] = 0
+                # --- NEW LOGIC ---
+                # Fallback: if there is no marker inside from mask_small or mask_large at last, add one
+                # We check if this specific large object has any marked pixels (m_slice > 0)
+                if not np.any(large_obj & (m_slice > 0)):
+                    free_pixels = large_obj & (m_slice == 0)
+                    if np.any(free_pixels):
+                        m_slice[free_pixels] = current_label
+                        current_label += 1
+                        markers_in_this_union += 1
+                # else ignore it
+                
+        # Safety Fallback: If no markers were assigned (all objects ignored), 
+        # keep the whole union object as a single marker to prevent it from disappearing.
+        if markers_in_this_union == 0:
+            free_pixels = union_obj & (m_slice == 0)
+            if np.any(free_pixels):
+                m_slice[free_pixels] = current_label
+                current_label += 1
+                
+    # 3. Do the watershed with the markers above to union_mask
     distance = ndi.distance_transform_edt(union_mask)
-    labels = segmentation.watershed(-distance, markers, mask=union_mask, watershed_line=True)
+    
+    # SHRINk MARKERS to single points (peaks) so watershed has room to grow and draw boundaries
+    # We find the center point of each existing marker to use as the true watershed seed
+    shrunk_markers = np.zeros_like(markers)
+    for marker_id in np.unique(markers)[1:]: # Skip 0 (background)
+        # Find the pixel in this marker region furthest from the background
+        marker_mask = (markers == marker_id)
+        local_dist = distance * marker_mask
+        
+        # Get coordinates of the maximum distance pixel
+        max_idx = np.argmax(local_dist)
+        coords = np.unravel_index(max_idx, local_dist.shape)
+        
+        # Place a single point marker
+        shrunk_markers[coords] = marker_id
+        
+    # Run watershed using the SHRUNK markers
+    labels = segmentation.watershed(-distance, shrunk_markers, mask=union_mask, watershed_line=True)
     
     return labels > 0
+
+def get_mask(img, log_sigma, cutoff, min_distance):
+    """Helper function to apply dot_2d and filter_shape in one step"""
+    mask_1 = dot_2d(img, log_sigma, cutoff)
+    mask_2 = dot_2d(img, log_sigma/2, cutoff/2)
+    mask_max = (img == 1.0)
+
+    merged = mask_1 | mask_2 | mask_max
+    mask = remove_diagonal_bridges(separate_attached_objects_watershed(merged, min_distance))
+    return mask
 
 def process_roi_image(roi_img, roi_mask, save_prefix=None):
     """
@@ -192,150 +272,132 @@ def process_roi_image(roi_img, roi_mask, save_prefix=None):
     """
     # === BRANCH 1: Radius 20 (Large/Medium features) ===
     # 1. Background Subtract (Radius 20)
-    bg_1 = bg_tools.estimate_background_rolling_ball(roi_img, radius=20)
-    # Subtract safely
-    sub_1 = roi_img.astype(np.float32) - bg_1.astype(np.float32)
-    sub_1 = np.clip(sub_1, 0, None) # Clip negatives
+    # CHANGED: Get background-subtracted image DIRECTLY (create_background=False)
+    # This replaces the manual subtraction step.
+    sub_1 = bg_tools.estimate_background_rolling_ball(roi_img, radius=10, create_background=False)
     
-    # 2. Normalize
-    norm_1 = normalize_minmax(sub_1)
+    # Ensure float32 for processing and clip any potential negatives
+    sub_1 = sub_1.astype(np.float32)
+    sub_1 = np.clip(sub_1, 0, None)
     
-    # 3. Dot Detect
-    mask_1 = dot_2d(norm_1, log_sigma=4.0, cutoff=0.07)
-    mask_2 = dot_2d(norm_1, log_sigma=2.0, cutoff=0.05)
-    
-    # 4. Merge & Watershed
-    merged_1 = mask_1 | mask_2
-    mask_a = separate_attached_objects_watershed(merged_1, min_distance=6)
+    # 2. Normalize, b for bright, d for dim
+    norm_1_b = normalize_minmax(sub_1, high_bright=True)
+    norm_1_d = normalize_minmax(sub_1, high_bright=False)
+    # 
+    mask_1_b = get_mask(norm_1_b, log_sigma=6.0, cutoff=0.5, min_distance=4)
+    mask_1_d = get_mask(norm_1_d, log_sigma=6.0, cutoff=0.4, min_distance=4)
 
+    mask_1 = remove_diagonal_bridges(smart_merge_objects(mask_1_b, mask_1_d))
     # === BRANCH 2: Radius 3 (Small/Fine features) ===
     # 1. Background Subtract (Radius 3)
-    bg_2 = bg_tools.estimate_background_rolling_ball(roi_img, radius=3)
-    sub_2 = roi_img.astype(np.float32) - bg_2.astype(np.float32)
+    # CHANGED: Get background-subtracted image DIRECTLY
+    sub_2 = bg_tools.estimate_background_rolling_ball(roi_img, radius=2, create_background=False)
+    
+    sub_2 = sub_2.astype(np.float32)
     sub_2 = np.clip(sub_2, 0, None)
     
-    # 2. Normalize
-    norm_2 = normalize_minmax(sub_2)
-    
     # 3. Dot Detect
-    mask_3 = dot_2d(norm_2, log_sigma=2.0, cutoff=0.08)  
-    mask_4 = dot_2d(norm_2, log_sigma=1.0, cutoff=0.04)
-    
-    # 4. Merge & Watershed
-    raw_merged_2 = mask_3 | mask_4
-    merged_2 = filter_shape(raw_merged_2)
-    mask_b = separate_attached_objects_watershed(merged_2, min_distance=4)
+    norm_2_b = normalize_minmax(sub_2, high_bright=True)
+    norm_2_d = normalize_minmax(sub_2, high_bright=False)
+    # 
+    mask_2_b = get_mask(norm_2_b, log_sigma=2.0, cutoff=0.5, min_distance=3)
+    mask_2_d = get_mask(norm_2_d, log_sigma=2.0, cutoff=0.4, min_distance=3)
+
+    mask_2 = filter_shape(remove_diagonal_bridges(smart_merge_objects(mask_2_b, mask_2_d)))
+
+    # === FINAL MERGE ===
+    final_combined = remove_diagonal_bridges(smart_merge_objects(mask_1, mask_2))
 
     # === NEW: DEBUG SAVING ===
     if save_prefix:
-        tifffile.imwrite(f"{save_prefix}_debug_mask_a.tif", (mask_a * 255).astype(np.uint8))
-        tifffile.imwrite(f"{save_prefix}_debug_mask_b.tif", (mask_b * 255).astype(np.uint8))
-
-    # === FINAL MERGE ===
-    # OLD CODE: final_combined = mask_a | mask_b
-    
-    # CHANGED: Use smart merge to keep mask_b separations inside mask_a shapes
-    # === FINAL MERGE ===
-    final_combined = smart_merge_objects(mask_a, mask_b)
+        tifffile.imwrite(f"{save_prefix}_debug_mask_1_b.tif", (mask_1_b * 255).astype(np.uint8))
+        tifffile.imwrite(f"{save_prefix}_debug_mask_1_d.tif", (mask_1_d * 255).astype(np.uint8))
+        tifffile.imwrite(f"{save_prefix}_debug_mask_2_b.tif", (mask_2_b * 255).astype(np.uint8))
+        tifffile.imwrite(f"{save_prefix}_debug_mask_2_d.tif", (mask_2_d * 255).astype(np.uint8))
+        tifffile.imwrite(f"{save_prefix}_debug_mask_1.tif", (mask_1 * 255).astype(np.uint8))
+        tifffile.imwrite(f"{save_prefix}_debug_mask_2.tif", (mask_2 * 255).astype(np.uint8))
     
     # Mask OUTSIDE pixels
-    final_combined = final_combined & roi_mask
-    
-    # CHANGED: Physically break diagonal touches before saving
-    final_combined = remove_diagonal_bridges(final_combined)
+    final_combined = final_combined & roi_mask    
     
     # Clean up small objects (connectivity=1 is now natural)
     final_cleaned = morphology.remove_small_objects(final_combined, min_size=5, connectivity=1)
     
     return final_cleaned
 
-def process_folder(input_folder, output_folder):
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
+def process_single_file(input_filepath, debug=True):
+    """
+    Processes a single 16-bit TIF file.
+    Looks for 'rois.zip' in the same directory.
+    Saves output masks in the same directory.
+    """
+    # 1. Get path information
+    if not input_filepath.exists():
+        print(f"Error: File not found: {input_filepath}")
+        return
 
-    # 1. Check all TIF files
-    all_files = glob.glob(os.path.join(input_folder, "*.tif"))
-    raw_files = [f for f in all_files if "mask" not in f.lower()]
-    
-    print(f"Found {len(raw_files)} raw images in {input_folder}")
+    input_dir = input_filepath.parent
+    filename = input_filepath.name
+    base_name = input_filepath.stem  # Replaces os.path.splitext(filename)[0]   
 
-    for filepath in raw_files:
-        filename = os.path.basename(filepath)
-        base_name = os.path.splitext(filename)[0]
+    try:
+        # Load Full Image
+        raw_img = tifffile.imread(input_filepath)
         
-        # 2. Find suffix "_rois.zip"
-        roi_zip_path = os.path.join(input_folder, f"{base_name}_rois.zip")
-        
-        if not os.path.exists(roi_zip_path):
-            print(f"Skipping {filename}: ROI file not found ({base_name}_rois.zip)")
-            continue
+        rois = roi_tools.load_roi_file(input_filepath)
+        if not rois:
+            return
 
-        print(f"Processing {filename} with ROIs...")
-
-        try:
-            # Load Full Image
-            raw_img = tifffile.imread(filepath)
+        for roi_name, roi_data in rois.items():
+            print(f"  > Processing ROI: {roi_name}")
             
-            # Read ROIs
-            rois = read_roi_zip(roi_zip_path)
-            if not rois:
-                print("  > Zip file contained no ROIs.")
+            # 3. Create boolean mask for the ROI
+            roi_mask = roi_tools.roi_to_mask(roi_data, raw_img.shape)
+            
+            # 4. Extract Bounding Box
+            coords = np.argwhere(roi_mask)
+            if coords.size == 0:
                 continue
-
-            for roi_name, roi_data in rois.items():
-                print(f"  > Processing ROI: {roi_name}")
-                
-                # 3. Create boolean mask for the ROI
-                roi_mask = roi_to_mask(roi_data, raw_img.shape)
-                
-                # 4. Extract Bounding Box (To create a smaller "duplicate" image)
-                # finding the bounding box allows us to process a smaller array
-                coords = np.argwhere(roi_mask)
-                if coords.size == 0:
-                    continue
-                
-                r_min, c_min = coords.min(axis=0)
-                r_max, c_max = coords.max(axis=0) + 1 # +1 for slice inclusive
-                
-                # Crop the image (This acts as the "Duplicate")
-                roi_crop = raw_img[r_min:r_max, c_min:c_max].copy()
-                roi_mask_crop = roi_mask[r_min:r_max, c_min:c_max]
-                
-                # --- RUN SEGMENTATION ON THE CROP ---
-                # We only process if there is actual data
-                # --- RUN SEGMENTATION ON THE CROP ---
-                # We only process if there is actual data
-                if np.max(roi_crop) > 0:
-                    
-                    # CHANGED: Create a prefix for this specific ROI
-                    debug_prefix = os.path.join(output_folder, f"{base_name}_{roi_name}")
-                    
-                    # CHANGED: Pass the prefix to the function
-                    seg_mask_crop = process_roi_image(roi_crop, roi_mask_crop, save_prefix=debug_prefix)
-                    
+            
+            r_min, c_min = coords.min(axis=0)
+            r_max, c_max = coords.max(axis=0) + 1
+            
+            # Crop the image
+            roi_crop = raw_img[r_min:r_max, c_min:c_max].copy()
+            roi_mask_crop = roi_mask[r_min:r_max, c_min:c_max]
+            
+            # --- RUN SEGMENTATION ON THE CROP ---
+            if np.max(roi_crop) > 0:
+                if debug:
+                    # Construct prefix as Path, then convert to str for string concatenation in sub-functions
+                    debug_prefix = str(input_dir / f"{base_name}_{roi_name}")
                 else:
-                    seg_mask_crop = np.zeros_like(roi_crop, dtype=bool)
-
-                # 5. Place crop back into full image size for saving
-                final_full_mask = np.zeros_like(raw_img, dtype=bool)
-                final_full_mask[r_min:r_max, c_min:c_max] = seg_mask_crop
+                    debug_prefix = None
                 
-                # 6. Save
-                save_name = f"{base_name}_{roi_name}_mask.tif"
-                save_path = os.path.join(output_folder, save_name)
-                
-                save_img = (final_full_mask * 255).astype(np.uint8)
-                tifffile.imwrite(save_path, save_img)
-                print(f"    Saved: {save_name}")
+                # If debug_prefix is None, process_roi_image will NOT save the intermediate TIFs
+                seg_mask_crop = process_roi_image(roi_crop, roi_mask_crop, save_prefix=debug_prefix)
+            else:
+                seg_mask_crop = np.zeros_like(roi_crop, dtype=bool)
 
-        except Exception as e:
-            print(f"Error processing {filename}: {e}")
-            import traceback
-            traceback.print_exc()
+            # 5. Place crop back into full image size
+            final_full_mask = np.zeros_like(raw_img, dtype=bool)
+            final_full_mask[r_min:r_max, c_min:c_max] = seg_mask_crop
+            
+            # 6. Save Output (In the SAME folder)
+            save_name = f"{base_name}_{roi_name}_mask.tif"
+            save_path = input_dir / save_name
+            
+            save_img = (final_full_mask * 255).astype(np.uint8)
+            tifffile.imwrite(save_path, save_img)
+            print(f"Saved: {save_name}")
+
+    except Exception as e:
+        print(f"Error processing {filename}: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
-    # --- CONFIGURATION ---
-    input_dir = r"F:\20250517 PFKL-mCherry_Queen37C_MitotrackerDeepred - High Salt Conc - 37 degree - WideField\Plate 2 - 180 mM\Cell6\1_AddSalt45min\Red input"
-    output_dir = r"F:\20250517 PFKL-mCherry_Queen37C_MitotrackerDeepred - High Salt Conc - 37 degree - WideField\Plate 2 - 180 mM\Cell6\1_AddSalt45min\Output"
     bg_tools.init_imagej()
-    process_folder(input_dir, output_dir)
+    
+    # Process the single file
+    process_single_file(cfg.R_RAW, cfg.DEBUG_MODE)
