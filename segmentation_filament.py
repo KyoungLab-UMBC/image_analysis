@@ -92,17 +92,28 @@ def compute_vesselness2D(eigen2, tau):
     response[np.isinf(response)] = 0
     return response
 
-def filament_3d_wrapper(struct_img: np.ndarray, f3_param):
-    """Wrapper for 3D filament filter."""
+def vesselnessSliceBySlice(struct_img: np.ndarray, f_param: list):
+    """wrapper for slice-by-slice 2d filament filter on a 3D stack"""
+    assert len(struct_img.shape) == 3, "image has to be 3D"
     bw = np.zeros(struct_img.shape, dtype=bool)
-    for fid in range(len(f3_param)):
-        sigma = f3_param[fid][0]
-        # Calculate Hessian
-        eigenvalues = absolute_3d_hessian_eigenvalues(struct_img, sigma=sigma, scale=True, whiteonblack=True)
-        # Calculate Vesselness
-        responce = compute_vesselness3D(eigenvalues[1], eigenvalues[2], tau=1)
-        # Apply Cutoff and OR operation
-        bw = np.logical_or(bw, responce > f3_param[fid][1])
+    
+    for fid in range(len(f_param)):
+        sigma = f_param[fid][0]
+        cutoff = f_param[fid][1]
+        
+        for zz in range(struct_img.shape[0]):
+            slice_img = struct_img[zz, :, :]
+            
+            # Compute Hessian eigenvalues for the 2D slice
+            # absolute_3d_hessian_eigenvalues supports N-dimensional arrays
+            eigenvalues = absolute_3d_hessian_eigenvalues(slice_img, sigma=sigma, scale=True, whiteonblack=True)
+            
+            # Compute 2D vesselness (using the largest absolute eigenvalue)
+            response = compute_vesselness2D(eigenvalues[1], tau=1)
+            
+            # Apply cutoff and combine with the boolean mask using logical OR
+            bw[zz, :, :] = np.logical_or(bw[zz, :, :], response > cutoff)
+            
     return bw
 
 def filament_2d_wrapper(struct_img: np.ndarray, f2_param):
@@ -134,28 +145,9 @@ def filament_2d_wrapper(struct_img: np.ndarray, f2_param):
 # PART 2: Main Processing Pipeline
 # ==========================================
 
-def get_roi_bounding_box(roi_data):
-    """Extract bounding box (y_min, y_max, x_min, x_max) from ROI data."""
-    # ImageJ ROIs usually provide top, left, width, height or coordinates
-    if 'y' in roi_data and 'x' in roi_data:
-        # Rectangle or similar
-        r_top = roi_data['y']
-        r_left = roi_data['x']
-        r_height = roi_data['height']
-        r_width = roi_data['width']
-        return int(r_top), int(r_top + r_height), int(r_left), int(r_left + r_width)
-    
-    # Fallback for polygon/freehand types if they store explicit coords
-    if 'x' in roi_data and isinstance(roi_data['x'], list):
-        xs = roi_data['x']
-        ys = roi_data['y']
-        return int(min(ys)), int(max(ys)), int(min(xs)), int(max(xs))
-        
-    raise ValueError("Could not determine bounding box for ROI")
-
-
 def process_single_image(image_path, sigma_cutoff_pairs):
     print(f"Processing: {image_path}")
+    image_path = Path(image_path)
     
     # 1. Load Image
     try:
@@ -163,82 +155,117 @@ def process_single_image(image_path, sigma_cutoff_pairs):
     except Exception as e:
         print(f"Error reading image: {e}")
         return
+    
+    img = ndi.gaussian_filter(img, sigma=1.0)
 
     # Check dims
     ndim = img.ndim
     is_3d = ndim == 3
     print(f"Image shape: {img.shape}, Detected as {'3D' if is_3d else '2D'}")
-    
-    rois = roi_tools.load_roi_file(cfg.R_RAW)
 
-    # 3. Iterate ROIs
-    for roi_name, roi_data in rois.items():
-        print(f"  > Processing ROI {roi_name}")
-        
-        # === CHANGED PART START ===
-        # Instead of 'get_roi_bounding_box', we generate the mask first (Robust Method)
-        
-        # Calculate mask for the specific 2D plane
-        shape_2d = img.shape[-2:] # Height, Width
-        roi_mask = roi_tools.roi_to_mask(roi_data, shape_2d)
-        
+    if is_3d:
+        # ==========================================
+        # 3D PROCESSING PIPELINE
+        # ==========================================
+        cell_mask_path = cfg.CELL_MASK
+        roi_name = cell_mask_path.stem
+        print(f"  > Processing 3D volume using mask: {roi_name}")
+
+        try:
+            roi_mask = tifffile.imread(cell_mask_path).astype(bool)
+        except Exception as e:
+            print(f"    Error reading 3D cell mask {cell_mask_path}: {e}")
+            return
+            
         # Get Bounding Box from the binary mask
         coords = np.argwhere(roi_mask)
         if coords.size == 0:
-            print("    ROI mask is empty (possibly outside image bounds). Skipping.")
-            continue
+            print("    ROI mask is empty. Skipping.")
+            return
             
-        # Calculate bounds (min/max of True pixels)
-        y1, x1 = coords.min(axis=0)
-        y2, x2 = coords.max(axis=0) + 1 # +1 because slices are exclusive
+        # Calculate bounds (min/max of True pixels) for 3D: Z, Y, X
+        z1, y1, x1 = coords.min(axis=0)
+        z2, y2, x2 = coords.max(axis=0) + 1 # +1 because slices are exclusive
         
-        # Crop Image
-        if is_3d:
-            img_crop_raw = img[:, y1:y2, x1:x2]
-        else:
-            img_crop_raw = img[y1:y2, x1:x2]
-            
+        # Crop the image in all 3 dimensions
+        img_crop_raw = img[z1:z2, y1:y2, x1:x2]
+        
         # Crop the ROI mask as well (to apply after segmentation)
-        roi_mask_crop = roi_mask[y1:y2, x1:x2]
-        # === CHANGED PART END ===
+        roi_mask_crop = roi_mask[z1:z2, y1:y2, x1:x2]
 
-        if img_crop_raw.size == 0:
-            print("    ROI crop is empty. Skipping.")
-            continue
-        
-        # 4. Normalization (Sample 1/100 pixels)
-        img_crop = bg_tools.estimate_background_rolling_ball(img_crop_raw, radius=10, create_background=False, use_paraboloid=False)
-        img_norm = normalize_minmax(img_crop)
+        img_norm = normalize_minmax(img_crop_raw, high_bright=True)
 
-        # 5. Segmentation
-        print("    Running segmentation...")
-        if is_3d:
-            seg_crop = filament_3d_wrapper(img_norm, sigma_cutoff_pairs)
-        else:
-            seg_crop = filament_2d_wrapper(img_norm, sigma_cutoff_pairs)
+        # Segmentation
+        print("    Running 3D segmentation...")
+        seg_crop = vesselnessSliceBySlice(img_norm, sigma_cutoff_pairs)
 
-        # 6. Apply ROI Polygon Mask (Pixels outside the exact shape become 0)
-        if is_3d:
-            seg_crop = np.logical_and(seg_crop, roi_mask_crop[np.newaxis, :, :])
-        else:
-            seg_crop = np.logical_and(seg_crop, roi_mask_crop)
+        seg_crop = np.logical_and(seg_crop, roi_mask_crop)
 
-        # 7. Cleanup
+        # Cleanup
         seg_crop = remove_small_objects(seg_crop, min_size=16)
-
         # 8. Output Construction
         full_mask = np.zeros(img.shape, dtype=np.uint8)
-        
-        if is_3d:
-            full_mask[:, y1:y2, x1:x2] = seg_crop.astype(np.uint8) * 255
-        else:
+        full_mask[z1:z2, y1:y2, x1:x2] = seg_crop.astype(np.uint8) * 255
+
+    else:
+        # ==========================================
+        # 2D PROCESSING PIPELINE
+        # ==========================================
+        # Search for ROIs (Try specific name first, then generic rois.zip)
+        rois = roi_tools.load_roi_file(cfg.R_RAW)
+
+        # Iterate ROIs
+        for roi_name, roi_data in rois.items():
+            print(f"  > Processing ROI: {roi_name}")
+            
+            # Calculate mask for the specific 2D plane
+            shape_2d = img.shape[-2:] # Height, Width
+            roi_mask = roi_tools.roi_to_mask(roi_data, shape_2d)
+            
+            # Get Bounding Box from the binary mask
+            coords = np.argwhere(roi_mask)
+            if coords.size == 0:
+                print("    ROI mask is empty (possibly outside image bounds). Skipping.")
+                continue
+                
+            # Calculate bounds (min/max of True pixels)
+            y1, x1 = coords.min(axis=0)
+            y2, x2 = coords.max(axis=0) + 1 # +1 because slices are exclusive
+            
+            # Crop Image
+            img_crop_raw = img[y1:y2, x1:x2]
+                
+            # Crop the ROI mask as well (to apply after segmentation)
+            roi_mask_crop = roi_mask[y1:y2, x1:x2]
+            # === CHANGED PART END ===
+
+            if img_crop_raw.size == 0:
+                print("    ROI crop is empty. Skipping.")
+                continue
+            
+            # 4. Normalization (Sample 1/100 pixels)
+            img_crop = bg_tools.estimate_background_rolling_ball(img_crop_raw, radius=10, create_background=False, use_paraboloid=False)
+            img_norm = normalize_minmax(img_crop)
+
+            # Segmentation
+            print("    Running 2D segmentation...")
+            seg_crop = filament_2d_wrapper(img_norm, sigma_cutoff_pairs)
+
+            # Apply ROI Polygon Mask
+            seg_crop = np.logical_and(seg_crop, roi_mask_crop)
+
+            # Cleanup
+            seg_crop = remove_small_objects(seg_crop, min_size=16)
+
+            # Output Construction
+            full_mask = np.zeros(img.shape, dtype=np.uint8)
             full_mask[y1:y2, x1:x2] = seg_crop.astype(np.uint8) * 255
 
-        # Save
-        output_name = f"{image_path.stem}_{roi_name}_mask.tif"
-        output_path = image_path.parent / output_name
-        tifffile.imwrite(output_path, full_mask)
-        print(f"    Saved: {output_name}")
+    # Save
+    output_name = f"{image_path.stem}_{roi_name}_mask.tif"
+    output_path = image_path.parent / output_name
+    tifffile.imwrite(output_path, full_mask)
+    print(f"    Saved: {output_name}")
 
 # ==========================================
 # PART 3: Execution Configuration
