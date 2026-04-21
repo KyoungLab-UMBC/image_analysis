@@ -43,12 +43,11 @@ def analyze_profile_trend(norm_r, norm_g):
 
     # 3. Logic Tree
     classification = "No trend"
-    partition_coefficient_r = 1
+    partition_coefficient_r = max(norm_r[:abbe_limit]) / min(norm_r)
     partition_coefficient_g = 1
 
     if (r_value >= 0.5 or max(norm_g) - max(norm_g[:1]) < 0.8 * prominence or (norm_g[0] > norm_g[1] and norm_g[1] > norm_g[2] and norm_g[0] - norm_g[3] > 1.6 * prominence)) and norm_g[0] > np.median(norm_g):
         classification = "Colocalized"
-        partition_coefficient_r = max(norm_r[:abbe_limit]) / min(norm_r)
         partition_coefficient_g = max(norm_g[:abbe_limit]) / min(norm_g)
     elif (r_value <= -0.5 or min(norm_g[:1]) == min(norm_g)) and np.median(norm_g) - min(norm_g[:2]) >= 2.4 * prominence:
         classification = "Anticolocalized"
