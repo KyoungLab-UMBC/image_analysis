@@ -96,8 +96,8 @@ def create_composite_thumbnail(norm_r, norm_g, norm_m=None):
     return img_stream
 
 def process_single_object(data_package):
-    # --- CHANGED: Unpack new r_name and g_name arguments ---
-    (obj_id, cy, cx, area, crop_r, crop_g, crop_m, crop_mask, mito_mode, dist_val, r_name, g_name, generate_slides) = data_package
+    # --- CHANGED: Unpack new crop_roi_mask argument ---
+    (obj_id, cy, cx, area, crop_r, crop_g, crop_m, crop_mask, crop_roi_mask, mito_mode, dist_val, r_name, g_name, generate_slides) = data_package
 
     h, w = crop_r.shape
     center_y, center_x = h // 2, w // 2
@@ -136,7 +136,7 @@ def process_single_object(data_package):
     
     for r in range(21):
         ring_mask = (radii_map >= r) & (radii_map < r + 1)
-        valid_mask = (crop_mask == 0) | (crop_mask == obj_id)
+        valid_mask = ((crop_mask == 0) | (crop_mask == obj_id)) & crop_roi_mask
         final_mask = ring_mask & valid_mask
         
         vals_r = norm_img_r[final_mask]
@@ -149,7 +149,7 @@ def process_single_object(data_package):
     final_g = np.array(profile_g)
     
     # --- 3. Classification ---
-    size_class = "small glucosome" if area <= 14 else "large glucosome"
+    size_class = "Small glucosome" if area <= 14 else "Large glucosome"
     trend_class, r_value, sigma, pc_r, pc_g = trend_tools.analyze_profile_trend(final_r, final_g)
 
     # --- CHANGED: Outlier Detection ---
@@ -163,9 +163,9 @@ def process_single_object(data_package):
     if mito_mode:
         # Check distance threshold (275 nm)
         if dist_val is not None and dist_val <= 275:
-            mito_status = "Attached"
+            mito_status = "Associated"
         else:
-            mito_status = "Not Attached"
+            mito_status = "Dissociated"
     
     # --- 4. Plotting ---
     plot_bytes = b""
@@ -240,11 +240,11 @@ def processing_cell_roi(user_path, img_r, img_g, mito_mode, r_name, g_name, roi_
         # --- DISTANCE ANALYSIS END ---
     # --- NEW: Calculate Total Intensity inside the ROI (Denominator) ---
     # Use the imported roi_to_mask function
-    roi_mask_full = roi_tools.roi_to_mask(roi_data, img_r.shape)
+    roi_mask = roi_tools.roi_to_mask(roi_data, img_r.shape)
     
     # Calculate Total Intensity of R and G inside the ROI
-    total_roi_int_r = np.sum(img_r[roi_mask_full])
-    total_roi_int_g = np.sum(img_g[roi_mask_full])
+    total_roi_int_r = np.sum(img_r[roi_mask])
+    total_roi_int_g = np.sum(img_g[roi_mask])
     
     if total_roi_int_r == 0: total_roi_int_r = 1 # Avoid div/0
     if total_roi_int_g == 0: total_roi_int_g = 1
@@ -253,7 +253,7 @@ def processing_cell_roi(user_path, img_r, img_g, mito_mode, r_name, g_name, roi_
     print("Calculating background and separating regions...")
     
     # Delegate logic to region_separation.py
-    r_bg, g_bg, mask_hh, mask_lh, mask_hl, mask_ll = rs.separate_regions_and_bg(img_r, img_g, roi_mask_full)
+    r_bg, g_bg, mask_hh, mask_lh, mask_hl, mask_ll = rs.separate_regions_and_bg(img_r, img_g, roi_mask)
     
     # Save the 4 quadrant masks to a zip file
     regions_zip_path = user_path / f"{cfg.R_RAW.stem}_{roi_name}_regions.zip"
@@ -316,7 +316,7 @@ def processing_cell_roi(user_path, img_r, img_g, mito_mode, r_name, g_name, roi_
             crop_m = img_m[r1:r2, c1:c2]
 
         # Retrieve pre-calculated distance for this object
-        # Default to a large number (99999) if not found, so it classifies as "Not Attached"
+        # Default to a large number (99999) if not found, so it classifies as "Dissociated"
         dist_val = dist_map.get(prop.label, 99999) if mito_mode else None
 
         tasks.append((
@@ -325,6 +325,7 @@ def processing_cell_roi(user_path, img_r, img_g, mito_mode, r_name, g_name, roi_
             img_g[r1:r2, c1:c2],
             crop_m,                   
             labeled_mask[r1:r2, c1:c2],
+            roi_mask[r1:r2, c1:c2],
             mito_mode,
             dist_val,
             r_name, 
@@ -466,8 +467,8 @@ def processing_cell_roi(user_path, img_r, img_g, mito_mode, r_name, g_name, roi_
                 p.font.size = Inches(0.25)
                 if "Trend" in line and res['trend_class'] != "No trend":
                     p.font.bold = True
-                # Highlight Attached status
-                if "Mito" in line and "Attached" in line and "Not" not in line:
+                # Highlight Associated status
+                if "Mito" in line and "Associated" in line and "Not" not in line:
                     p.font.bold = True
 
     # =========================================================================
@@ -476,8 +477,8 @@ def processing_cell_roi(user_path, img_r, img_g, mito_mode, r_name, g_name, roi_
     
     # 1. Define Standard Types
     trend_types = ["Colocalized", "Around", "Anticolocalized", "No trend"]
-    size_types = ["small glucosome", "large glucosome"]
-    mito_types = ["Attached", "Not Attached"] if mito_mode else [None]
+    size_types = ["Small glucosome", "Large glucosome"]
+    mito_types = ["Associated", "Dissociated"] if mito_mode else [None]
 
     # 2. Build Categories List (Used for both Summary Slides and Excel Sheets)
     categories = []
@@ -536,7 +537,7 @@ def processing_cell_roi(user_path, img_r, img_g, mito_mode, r_name, g_name, roi_
     output_xlsx = output_pptx.with_suffix(".xlsx")
     
     # --- Calculate ROI Area and Means ---
-    roi_area = np.sum(roi_mask_full)
+    roi_area = np.sum(roi_mask)
     if roi_area == 0: roi_area = 1
     mean_roi_int_r = total_roi_int_r / roi_area
     mean_roi_int_g = total_roi_int_g / roi_area
@@ -653,7 +654,7 @@ def processing_cell_roi(user_path, img_r, img_g, mito_mode, r_name, g_name, roi_
                     subset = [r for r in results if r['trend_class'] == trend and r['size_class'] == size and r['mito_status'] == mito and not r['is_outlier']]
                     t_abbr = trend[:5] 
                     s_abbr = "Sm" if "small" in size else "Lg"
-                    m_abbr = "Att" if mito == "Attached" else "NotAtt"
+                    m_abbr = "Att" if mito == "Associated" else "NotAtt"
                     sheet_name = f"{t_abbr} {s_abbr} {m_abbr}"
                 else:
                     trend, size = cat_tuple
