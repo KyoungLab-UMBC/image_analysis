@@ -22,11 +22,24 @@ def create_dimetric_thumbnail_matplot(crop_r, crop_g):
     ax.yaxis.pane.fill = False
     ax.zaxis.pane.fill = False
 
-    s_start, s_end = 4, 17
-    sub_r = crop_r[s_start:s_end, s_start:s_end, s_start:s_end]
-    sub_g = crop_g[s_start:s_end, s_start:s_end, s_start:s_end]
+    # Find the original center of the incoming crop
+    d, h, w = crop_r.shape
+    cz_orig, cy_orig, cx_orig = d // 2, h // 2, w // 2
     
-    cz, cy, cx = 6, 6, 6 
+    # Calculate a 13x13x13 bounding box (-6 and +7 from the center)
+    # Using max() and min() ensures it won't crash if an object is on the absolute edge of the whole image
+    z_start, z_end = max(0, cz_orig - 6), min(d, cz_orig + 7)
+    y_start, y_end = max(0, cy_orig - 6), min(h, cy_orig + 7)
+    x_start, x_end = max(0, cx_orig - 6), min(w, cx_orig + 7)
+
+    # Slice the arrays
+    sub_r = crop_r[z_start:z_end, y_start:y_end, x_start:x_end]
+    sub_g = crop_g[z_start:z_end, y_start:y_end, x_start:x_end]
+    
+    # Calculate the new relative center coordinate for the sliced array
+    cz = cz_orig - z_start
+    cy = cy_orig - y_start
+    cx = cx_orig - x_start
 
     # --- NORMALIZE FUNCTION ---
     def get_normalized_channel(arr, is_red):
@@ -98,13 +111,24 @@ def create_dimetric_thumbnails_VTK(crop_r, crop_g):
     2. Green Transparency: Green contributes only 30% to opacity to prevent blocking.
     """
     
-    # --- 1. PRE-PROCESSING & DYNAMIC RANGE ---
-    s_start, s_end = 4, 17
-    sub_r = crop_r[s_start:s_end, s_start:s_end, s_start:s_end].astype(np.float32)
-    sub_g = crop_g[s_start:s_end, s_start:s_end, s_start:s_end].astype(np.float32)
+    # Find the original center of the incoming crop
+    d, h, w = crop_r.shape
+    cz_orig, cy_orig, cx_orig = d // 2, h // 2, w // 2
     
-    d, h, w = sub_r.shape
-    cz, cy, cx = d // 2, h // 2, w // 2
+    # Calculate a 13x13x13 bounding box (-6 and +7 from the center)
+    # Using max() and min() ensures it won't crash if an object is on the absolute edge of the whole image
+    z_start, z_end = max(0, cz_orig - 6), min(d, cz_orig + 7)
+    y_start, y_end = max(0, cy_orig - 6), min(h, cy_orig + 7)
+    x_start, x_end = max(0, cx_orig - 6), min(w, cx_orig + 7)
+
+    # Slice the arrays
+    sub_r = crop_r[z_start:z_end, y_start:y_end, x_start:x_end]
+    sub_g = crop_g[z_start:z_end, y_start:y_end, x_start:x_end]
+    
+    # Calculate the new relative center coordinate for the sliced array
+    cz = cz_orig - z_start
+    cy = cy_orig - y_start
+    cx = cx_orig - x_start
 
     # --- Red Dynamic Range: Min to Center Pixel ---
     min_r = np.min(sub_r)
@@ -125,8 +149,11 @@ def create_dimetric_thumbnails_VTK(crop_r, crop_g):
     norm_g = (sub_g - min_g) / (max_g - min_g)
     norm_g = np.clip(norm_g, 0.0, 1.0)
 
-    # --- 2. MIX TO RGBA ---
-    rgba_vol = np.zeros((d, h, w, 4), dtype=np.uint8)
+    #1. Get the NEW dimensions from the cropped 13x13x13 cube
+    d_sub, h_sub, w_sub = sub_r.shape
+    
+    # 2. Create the RGBA volume using the new dimensions
+    rgba_vol = np.zeros((d_sub, h_sub, w_sub, 4), dtype=np.uint8)
     
     # Colors remain full strength (0-255)
     rgba_vol[..., 0] = (norm_r * 255).astype(np.uint8) # R
@@ -135,10 +162,10 @@ def create_dimetric_thumbnails_VTK(crop_r, crop_g):
     
     # --- 3. CALCULATE SMART ALPHA ---
     # A. Box Distance (Chebyshev) - Handles Cube Shape
-    zz, yy, xx = np.indices((d, h, w))
+    zz, yy, xx = np.ogrid[:d_sub, :h_sub, :w_sub]
     box_dist = np.maximum(np.abs(zz - cz), np.maximum(np.abs(yy - cy), np.abs(xx - cx)))
     
-    max_dist = d // 2
+    max_dist = d_sub // 2                # <-- FIX 1: Changed d to d_sub
     if max_dist == 0: max_dist = 1
     
     # Gradient: 1.0 at center -> 0.2 at box edges
@@ -161,7 +188,7 @@ def create_dimetric_thumbnails_VTK(crop_r, crop_g):
     vtk_data = numpy_support.numpy_to_vtk(num_array=data_flat, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR)
     
     img = vtk.vtkImageData()
-    img.SetDimensions(w, h, d)
+    img.SetDimensions(w_sub, h_sub, d_sub)  # <-- FIX 2: Changed w, h, d to w_sub, h_sub, d_sub
     img.GetPointData().SetScalars(vtk_data)
     
     mapper = vtk.vtkSmartVolumeMapper()
@@ -208,9 +235,10 @@ def create_dimetric_thumbnails_VTK(crop_r, crop_g):
     render_window.SetSize(400, 400)
     
     camera = renderer.GetActiveCamera()
+    renderer.ResetCamera()               # <-- MOVE THIS: Center focal point first
     camera.Elevation(20)
     camera.Azimuth(30)
-    renderer.ResetCamera()
+    renderer.ResetCameraClippingRange()  # <-- ADD THIS: Update clipping planes
     camera.Zoom(1.3)
     
     render_window.Render()
@@ -229,6 +257,7 @@ def create_dimetric_thumbnails_VTK(crop_r, crop_g):
 
     # View 2 (Rotate 90)
     camera.Azimuth(90)
+    renderer.ResetCameraClippingRange()
     render_window.Render()
     w2if.Modified()
     w2if.Update()
