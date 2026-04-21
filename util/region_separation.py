@@ -7,32 +7,41 @@ from scipy.ndimage import gaussian_filter
 from util.roi_to_mask import roi_to_mask
 import util.config as cfg
 
-def separate_regions_and_bg(img_r, img_g, roi_mask_full):
-    """Calculates background and separates the ROI into 4 median-based quadrants."""
+def separate_regions_and_bg(img_r, img_g, roi_mask):
+    """Calculates background and separates the ROI into 4 median-based quadrants.
+       Supports both 2D (Y, X) and 3D (Z, Y, X) inputs dynamically."""
+       
     # 1. Get bounding box of the ROI to save processing time
-    coords = np.column_stack(np.where(roi_mask_full))
+    coords = np.column_stack(np.where(roi_mask))
     if coords.size > 0:
-        y0, x0 = coords.min(axis=0)
-        y1, x1 = coords.max(axis=0) + 1
+        # Dynamically create slice objects for any number of dimensions
+        bbox_slices = tuple(slice(c_min, c_max) for c_min, c_max in zip(coords.min(axis=0), coords.max(axis=0) + 1))
     else:
-        y0, x0, y1, x1 = 0, 0, img_r.shape[0], img_r.shape[1]
+        # Fallback to the entire array shape if mask is somehow empty
+        bbox_slices = tuple(slice(0, s) for s in img_r.shape)
 
-    # 2. Run rolling ball only on the bounding box and map back to full size
+    # 2. Run rolling ball (gaussian) only on the bounding box and map back to full size
     r_bg = np.zeros_like(img_r, dtype=float)
     g_bg = np.zeros_like(img_g, dtype=float)
     
-    r_bg[y0:y1, x0:x1] = gaussian_filter(img_r[y0:y1, x0:x1].astype(float), sigma=5)
-    g_bg[y0:y1, x0:x1] = gaussian_filter(img_g[y0:y1, x0:x1].astype(float), sigma=5)
+    # bbox_slices automatically acts as [y0:y1, x0:x1] in 2D, or [z0:z1, y0:y1, x0:x1] in 3D
+    r_bg[bbox_slices] = gaussian_filter(img_r[bbox_slices].astype(float), sigma=5)
+    g_bg[bbox_slices] = gaussian_filter(img_g[bbox_slices].astype(float), sigma=5)
 
     # 3. Calculate medians ONLY within the valid ROI mask
-    r_bg_med = np.median(r_bg[roi_mask_full])
-    g_bg_med = np.median(g_bg[roi_mask_full])
+    # Added a safety check to prevent np.median errors if roi_mask is completely empty
+    if np.any(roi_mask):
+        r_bg_med = np.median(r_bg[roi_mask])
+        g_bg_med = np.median(g_bg[roi_mask])
+    else:
+        r_bg_med, g_bg_med = 0, 0
 
     # 4. Separate into 4 masks (restricted strictly to the ROI)
-    mask_hh = (r_bg >= r_bg_med) & (g_bg >= g_bg_med) & roi_mask_full
-    mask_lh = (r_bg < r_bg_med)  & (g_bg >= g_bg_med) & roi_mask_full
-    mask_hl = (r_bg >= r_bg_med) & (g_bg < g_bg_med) & roi_mask_full
-    mask_ll = (r_bg < r_bg_med)  & (g_bg < g_bg_med) & roi_mask_full
+    # Boolean logic and roi_mask indexing naturally handle any N-dimensional shape
+    mask_hh = (r_bg >= r_bg_med) & (g_bg >= g_bg_med) & roi_mask
+    mask_lh = (r_bg < r_bg_med)  & (g_bg >= g_bg_med) & roi_mask
+    mask_hl = (r_bg >= r_bg_med) & (g_bg < g_bg_med) & roi_mask
+    mask_ll = (r_bg < r_bg_med)  & (g_bg < g_bg_med) & roi_mask
     
     return r_bg, g_bg, mask_hh, mask_lh, mask_hl, mask_ll
 
