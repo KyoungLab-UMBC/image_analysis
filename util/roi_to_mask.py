@@ -62,7 +62,6 @@ def load_roi_file(image_path):
             try:
                 # Convert Path object to string for read_roi_zip compatibility
                 rois = read_roi_zip(str(p))
-                print(f"  Found ROIs at: {p.name}")
                 break
             except Exception as e:
                 print(f"  Error reading {p.name}: {e}")
