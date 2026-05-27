@@ -274,6 +274,7 @@ def process_roi_image(roi_img, roi_mask, save_prefix=None):
     # 1. Background Subtract (Radius 20)
     # CHANGED: Get background-subtracted image DIRECTLY (create_background=False)
     # This replaces the manual subtraction step.
+    roi_img = ndi.gaussian_filter(roi_img, sigma=1.0)
     sub_1 = bg_tools.estimate_background_rolling_ball(roi_img, radius=10, create_background=False)
     
     # Ensure float32 for processing and clip any potential negatives
@@ -321,7 +322,7 @@ def process_roi_image(roi_img, roi_mask, save_prefix=None):
     final_combined = final_combined & roi_mask    
     
     # Clean up small objects (connectivity=1 is now natural)
-    final_cleaned = morphology.remove_small_objects(final_combined, min_size=5, connectivity=1)
+    final_cleaned = morphology.remove_small_objects(final_combined, min_size=6, connectivity=1)
     
     return final_cleaned
 
@@ -400,4 +401,4 @@ if __name__ == "__main__":
     bg_tools.init_imagej()
     
     # Process the single file
-    process_single_file(cfg.R_RAW, cfg.DEBUG_MODE)
+    process_single_file(cfg.R_PATH, cfg.DEBUG_MODE)
