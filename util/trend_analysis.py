@@ -53,7 +53,7 @@ def analyze_profile_trend(norm_r, norm_g):
         classification = "Anticolocalized"
     elif np.any((peaks >= 1) & (peaks <= abbe_limit)) or max(norm_g) - max(norm_g[:abbe_limit]) <= prominence:
         classification = "Around"
-    elif r_value <= -0.5:
+    elif r_value <= -0.8:
         classification = "Anticolocalized"
 
     
