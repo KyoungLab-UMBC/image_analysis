@@ -8,7 +8,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 import numpy as np
 import tifffile
-from skimage import measure, draw
+from skimage import measure
 from pptx import Presentation
 from pptx.util import Inches
 from pptx.dml.color import RGBColor
@@ -16,8 +16,6 @@ import io
 import re
 import warnings
 import os
-from pathlib import Path
-from read_roi import read_roi_zip
 import concurrent.futures
 from PIL import Image 
 import pandas as pd
@@ -72,16 +70,23 @@ def create_composite_thumbnail(norm_r, norm_g, norm_m=None):
     rgb = np.zeros((h, w, 3), dtype=np.uint8)
     
     def scale_to_uint8(arr):
-        vmin = arr.min()
-        vmax = arr.max()
+        # Calculate the 1st and 99th percentiles
+        vmin = np.percentile(arr, 5)
+        vmax = np.percentile(arr, 99.5)
+        
         if vmax - vmin < 0.00001:
             return np.zeros_like(arr, dtype=np.uint8)
-        scaled = (arr - vmin) / (vmax - vmin) * 255
+            
+        # Clip values so anything < 1% becomes vmin, and > 99% becomes vmax
+        clipped = np.clip(arr, vmin, vmax)
+        
+        # Scale the clipped values to 0-255
+        scaled = (clipped - vmin) / (vmax - vmin) * 255
         return scaled.astype(np.uint8)
 
     if norm_m is not None:
         # MITO MODE: R=Mito, G=PFKL(RedData), B=GAPDH(GreenData)
-        rgb[..., 0] = scale_to_uint8(norm_m) 
+        rgb[..., 0] = np.where(norm_m > 0, 255, 0).astype(np.uint8)
         rgb[..., 1] = scale_to_uint8(norm_r) 
         rgb[..., 2] = scale_to_uint8(norm_g) 
     else:
@@ -155,7 +160,7 @@ def process_single_object(data_package):
     # --- CHANGED: Outlier Detection ---
     is_outlier = False
     # Check Max Intensity > 30 OR Peak not at center (index 0 or 1)
-    if np.max(final_r) > 30 or np.max(final_g) > 30 or np.argmax(final_r) not in [0, 1]:
+    if np.max(final_r) > 30 or np.max(final_g) > 30 or np.argmax(final_r) not in [0, 1] or area <=5 or final_r[0] <= 1.1:
         is_outlier = True
     
     # --- CHANGED: Distance Based Classification ---
@@ -209,14 +214,12 @@ def processing_cell_roi(user_path, img_r, img_g, mito_mode, r_name, g_name, roi_
     dist_map = {}
     mito_path = None
     if mito_mode:
-        mito_path = user_path / f"{cfg.MITO_RAW.stem}_{roi_name}_mask.tif"
+        mito_path = user_path / f"{cfg.MITO_PATH.stem}_{roi_name}_mask.tif"
     # Construct paths using stem and roi_name (cell_num)
-    r_mask_path = user_path / f"{cfg.R_RAW.stem}_{roi_name}_mask.tif"
+    r_mask_path = user_path / f"{cfg.R_PATH.stem}_{roi_name}_mask.tif"
     r_mask = tifffile.imread(r_mask_path)
-    output_pptx = user_path / f"{cfg.R_RAW.stem}_{roi_name}.pptx"
+    output_pptx = user_path / f"{cfg.R_PATH.stem}_{roi_name}.pptx"
     print(f"Analyzing ROI: {roi_name} | Output: {output_pptx.name}")
-    img_r = bg_tools.estimate_background_rolling_ball(img_r, radius=10, create_background=False, use_paraboloid=True)
-    img_g = bg_tools.estimate_background_rolling_ball(img_g, radius=10, create_background=False, use_paraboloid=True)
 
     if mito_mode and mito_path:
         print("Loading Mito Mask and calculating distances...")
@@ -256,7 +259,7 @@ def processing_cell_roi(user_path, img_r, img_g, mito_mode, r_name, g_name, roi_
     r_bg, g_bg, mask_hh, mask_lh, mask_hl, mask_ll = rs.separate_regions_and_bg(img_r, img_g, roi_mask)
     
     # Save the 4 quadrant masks to a zip file
-    regions_zip_path = user_path / f"{cfg.R_RAW.stem}_{roi_name}_regions.zip"
+    regions_zip_path = user_path / f"{cfg.R_PATH.stem}_{roi_name}_regions.zip"
     rs.save_masks_to_tifs(regions_zip_path, mask_hh, mask_lh, mask_hl, mask_ll)
 
     def get_out_val(bg_img, mask):
@@ -653,7 +656,7 @@ def processing_cell_roi(user_path, img_r, img_g, mito_mode, r_name, g_name, roi_
                     trend, size, mito = cat_tuple
                     subset = [r for r in results if r['trend_class'] == trend and r['size_class'] == size and r['mito_status'] == mito and not r['is_outlier']]
                     t_abbr = trend[:5] 
-                    s_abbr = "Sm" if "small" in size else "Lg"
+                    s_abbr = "Sm" if "Small" in size else "Lg"
                     m_abbr = "Att" if mito == "Associated" else "NotAtt"
                     sheet_name = f"{t_abbr} {s_abbr} {m_abbr}"
                 else:
@@ -737,7 +740,28 @@ def main():
         try:
             img_r = tifffile.imread(cfg.R_PATH)
             img_g = tifffile.imread(cfg.G_PATH)      
-            rois = roi_tools.load_roi_file(cfg.R_RAW)
+            rois = roi_tools.load_roi_file(cfg.R_PATH)
+
+            if cfg.G_NAME == "FBP":
+                img_g_gaussian_r = 20
+            elif cfg.G_NAME == "ATP":
+                img_g_gaussian_r = 10
+            elif cfg.G_NAME == "Pyruvate":
+                img_g_gaussian_r = 100
+            else:
+                img_g_gaussian_r = 20
+
+            img_r = bg_tools.estimate_background_rolling_ball(img_r, radius=10, create_background=False, use_paraboloid=True)
+            img_g = bg_tools.estimate_background_rolling_ball(img_g, radius=img_g_gaussian_r, create_background=False, use_paraboloid=True)
+
+            # Clip to prevent overflow and convert to 16-bit unsigned integer
+            img_r = np.clip(np.round(img_r), 0, 65535).astype(np.uint16)
+            img_g = np.clip(np.round(img_g), 0, 65535).astype(np.uint16)
+            
+            # Save as 16-bit TIF files
+            tifffile.imwrite(user_path / "img_r.tif", img_r)
+            tifffile.imwrite(user_path / "img_g.tif", img_g)
+
             if not rois:
                 print(f"Error: rois.zip not found in {cfg.USER_PATH}")
             else:             
