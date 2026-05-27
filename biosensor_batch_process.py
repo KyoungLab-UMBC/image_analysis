@@ -9,7 +9,7 @@ import itertools
 
 # ================= CONFIGURATION =================
 # 1. Input: Select your path here
-ROOT_PATH = r"F:\20231123 PFKL-mCherry_Hylight - High Salt Conc - 37 degree - WideField\Plate 1 - Hylight 180mM" 
+ROOT_PATH = r"F:\20240821 PFKL-mCherry_Hylight_MitotrackerDeepred - High Salt Conc - 21.4 degree - WideField\Plate 1 - 140 mM" 
 
 # 2. Toggle Queen37C Mode
 QUEEN37C = config.QUEEN37C
