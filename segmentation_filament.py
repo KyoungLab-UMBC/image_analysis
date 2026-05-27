@@ -206,13 +206,19 @@ def process_single_image(image_path, sigma_cutoff_pairs):
         # 8. Output Construction
         full_mask = np.zeros(img.shape, dtype=np.uint8)
         full_mask[z1:z2, y1:y2, x1:x2] = seg_crop.astype(np.uint8) * 255
+        
+        # Save
+        output_name = f"{image_path.stem}_{roi_name}_mask.tif"
+        output_path = image_path.parent / output_name
+        tifffile.imwrite(output_path, full_mask)
+        print(f"    Saved: {output_name}")
 
     else:
         # ==========================================
         # 2D PROCESSING PIPELINE
         # ==========================================
         # Search for ROIs (Try specific name first, then generic rois.zip)
-        rois = roi_tools.load_roi_file(cfg.R_RAW)
+        rois = roi_tools.load_roi_file(cfg.R_PATH)
 
         # Iterate ROIs
         for roi_name, roi_data in rois.items():
@@ -244,12 +250,15 @@ def process_single_image(image_path, sigma_cutoff_pairs):
                 continue
             
             # 4. Normalization (Sample 1/100 pixels)
-            img_crop = bg_tools.estimate_background_rolling_ball(img_crop_raw, radius=10, create_background=False, use_paraboloid=False)
+            img_crop = bg_tools.estimate_background_rolling_ball(img_crop_raw, radius=20, create_background=False, use_paraboloid=False)
             img_norm = normalize_minmax(img_crop)
+
+            max_img = (img_norm == 1.0)
 
             # Segmentation
             print("    Running 2D segmentation...")
             seg_crop = filament_2d_wrapper(img_norm, sigma_cutoff_pairs)
+            seg_crop = seg_crop | max_img
 
             # Apply ROI Polygon Mask
             seg_crop = np.logical_and(seg_crop, roi_mask_crop)
@@ -261,11 +270,11 @@ def process_single_image(image_path, sigma_cutoff_pairs):
             full_mask = np.zeros(img.shape, dtype=np.uint8)
             full_mask[y1:y2, x1:x2] = seg_crop.astype(np.uint8) * 255
 
-    # Save
-    output_name = f"{image_path.stem}_{roi_name}_mask.tif"
-    output_path = image_path.parent / output_name
-    tifffile.imwrite(output_path, full_mask)
-    print(f"    Saved: {output_name}")
+            # Save
+            output_name = f"{image_path.stem}_{roi_name}_mask.tif"
+            output_path = image_path.parent / output_name
+            tifffile.imwrite(output_path, full_mask)
+            print(f"    Saved: {output_name}")
 
 # ==========================================
 # PART 3: Execution Configuration
@@ -277,9 +286,9 @@ if __name__ == "__main__":
     # Format: [[scale, cutoff], [scale, cutoff], ...]
     # Adjust these based on your specific filament thickness and brightness
     FILAMENT_PARAMS = [
-        [1.0, 0.20],  
-        [1.5, 0.20]
+        [1.0, 0.15],  
+        [1.5, 0.15]
     ]
     bg_tools.init_imagej()  # Ensure ImageJ is initialized before processing
     # --- RUN ---
-    process_single_image(cfg.MITO_RAW, FILAMENT_PARAMS)
+    process_single_image(cfg.MITO_PATH, FILAMENT_PARAMS)
