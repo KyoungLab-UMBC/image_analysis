@@ -136,7 +136,7 @@ def get_object_data(mask_path, is_2d_mode):
     return objects_data, total_surface_cloud
 
 
-def analyze_distances(objects_source, cloud_target, is_2d_mode, s_xy, s_z):
+def analyze_distances(objects_source, cloud_target, is_2d_mode, s_xy = scalar_xy, s_z = scalar_z):
     """
     Calculates the minimum distance from every object in source to the 
     nearest pixel in the target point cloud.
