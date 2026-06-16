@@ -1,6 +1,6 @@
 import numpy as np
 
-def normalize_minmax(img, high_bright = True):
+def normalize_minmax(img, high_bright = True, percentile=99.4):
     """
     Normalize array to 0-1 range using the 99th percentile.
     Uses 1/100 pixel sampling for speed.
@@ -17,9 +17,9 @@ def normalize_minmax(img, high_bright = True):
     if high_bright:    
         min_v = np.min(sample)
         # CHANGED: Use 99th percentile instead of max to ignore hot pixels
-        max_v = np.percentile(sample, 99.4)
+        max_v = np.percentile(sample, percentile)
     else:
-        min_v = np.percentile(sample, 1.4)
+        min_v = np.percentile(sample, percentile)
         max_v = np.max(sample)
     
     # Safety check: if image is flat (or percentile equals min)
