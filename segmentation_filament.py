@@ -147,7 +147,6 @@ def filament_2d_wrapper(struct_img: np.ndarray, f2_param):
 
 def process_single_image(image_path, sigma_cutoff_pairs):
     print(f"Processing: {image_path}")
-    image_path = Path(image_path)
     
     # 1. Load Image
     try:
@@ -167,6 +166,7 @@ def process_single_image(image_path, sigma_cutoff_pairs):
         # ==========================================
         # 3D PROCESSING PIPELINE
         # ==========================================
+        img = bg_tools.estimate_background_rolling_ball(img, radius=10, create_background=False, use_paraboloid=False, stack=True)
         cell_mask_path = cfg.CELL_MASK
         roi_name = cell_mask_path.stem
         print(f"  > Processing 3D volume using mask: {roi_name}")
@@ -193,7 +193,7 @@ def process_single_image(image_path, sigma_cutoff_pairs):
         # Crop the ROI mask as well (to apply after segmentation)
         roi_mask_crop = roi_mask[z1:z2, y1:y2, x1:x2]
 
-        img_norm = normalize_minmax(img_crop_raw, high_bright=True)
+        img_norm = normalize_minmax(img_crop_raw, high_bright=True, percentile=99.995)
 
         # Segmentation
         print("    Running 3D segmentation...")
@@ -202,7 +202,7 @@ def process_single_image(image_path, sigma_cutoff_pairs):
         seg_crop = np.logical_and(seg_crop, roi_mask_crop)
 
         # Cleanup
-        seg_crop = remove_small_objects(seg_crop, min_size=16)
+        seg_crop = remove_small_objects(seg_crop, max_size=20, connectivity=3)
         # 8. Output Construction
         full_mask = np.zeros(img.shape, dtype=np.uint8)
         full_mask[z1:z2, y1:y2, x1:x2] = seg_crop.astype(np.uint8) * 255
@@ -286,8 +286,8 @@ if __name__ == "__main__":
     # Format: [[scale, cutoff], [scale, cutoff], ...]
     # Adjust these based on your specific filament thickness and brightness
     FILAMENT_PARAMS = [
-        [1.0, 0.15],  
-        [1.5, 0.15]
+        [1.0, 0.2],  
+        [1.5, 0.2]
     ]
     bg_tools.init_imagej()  # Ensure ImageJ is initialized before processing
     # --- RUN ---
