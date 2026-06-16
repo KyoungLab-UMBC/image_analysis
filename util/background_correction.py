@@ -2,6 +2,7 @@ import sys
 import numpy as np
 import scyjava
 import imagej
+import itertools
 
 # ---- Initialize ImageJ Global Variables ----
 ij = None
@@ -27,53 +28,53 @@ def init_imagej():
         print(f"Initialization Failed: {e}")
         sys.exit()
 
-def estimate_background_rolling_ball(img, radius=10, create_background=True, use_paraboloid=False):
-    """
-    Estimates or subtracts background using ImageJ's Native 'Subtract Background'.
-    
-    Parameters:
-    - img: Input image (numpy array).
-    - radius: Rolling ball radius.
-    - create_background: If True, returns the estimated background. 
-                         If False, returns the image with background subtracted.
-    - use_paraboloid: If True, uses the 'Sliding Paraboloid' algorithm.
-    """
-    # Ensure ImageJ is initialized before running
+def _restore_axis_order(arr, target_shape):
+    if arr.shape == target_shape:
+        return arr
+
+    if arr.ndim != len(target_shape):
+        return arr
+
+    for perm in itertools.permutations(range(arr.ndim)):
+        candidate = np.transpose(arr, perm)
+        if candidate.shape == target_shape:
+            return candidate
+
+    return arr
+
+def estimate_background_rolling_ball(img, radius=10, create_background=True, use_paraboloid=False, stack=False):
     if ij is None:
         init_imagej()
 
-    # 1. Convert NumPy -> ImagePlus
     imp_source = ij.py.to_imageplus(img)
-    
-    # 2. DUPLICATE to avoid in-place modification of the source
-    # We call this imp_copy because it will become either the background OR the result
     imp_copy = imp_source.duplicate()
 
-    # 3. Build Options String
     options_list = [f"rolling={radius}"]
-    
+
     if create_background:
         options_list.append("create")
-    
+
     if use_paraboloid:
         options_list.append("sliding")
 
-    options = " ".join(options_list)
+    if stack:
+        options_list.append("stack")
 
-    # 4. Run Rolling Ball
-    # Note: IJ.run modifies the image object in-place
+    options = " ".join(options_list)
     IJ.run(imp_copy, "Subtract Background...", options)
 
-    # 5. Convert back to NumPy
     result = ij.py.from_java(imp_copy)
-    
-    res_np = np.array(result)
-    if res_np.ndim > 2: res_np = res_np.squeeze()
-    
-    # --- NEW: MUST CLOSE TO FREE JAVA HEAP MEMORY ---
+    res_np = np.asarray(result)
+
+    # Only squeeze if the input was not 3D
+    if stack:
+        res_np = _restore_axis_order(res_np, img.shape)
+    else:
+        res_np = np.squeeze(res_np)
+
     imp_source.close()
     imp_copy.close()
-    # ------------------------------------------------    
+
     return res_np.astype(img.dtype)
 
 def force_garbage_collection():
